@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os  # ✅ ADDED
+import os
 import time
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
-
 
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
@@ -23,7 +22,7 @@ META_JSON = RAW_DIR / "prices_meta.json"
 
 DEFAULT_EXTRA_TICKERS = ["SPY", "^VIX"]
 
-# ✅ ADDED: allow workflow env to control max-years without changing CLI calls
+# allow workflow env to control max-years without changing CLI calls
 DEFAULT_MAX_YEARS = int(os.getenv("MAX_YEARS", "11"))
 
 
@@ -33,7 +32,44 @@ def now_utc_iso() -> str:
 
 def _utc_today_normalized() -> pd.Timestamp:
     # pandas/버전별 tz 처리 차이 방어
-    return pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+    # -> 항상 tz-naive normalized Timestamp로 반환
+    ts = pd.Timestamp.now(tz="UTC")
+    try:
+        ts = ts.tz_convert(None)  # tz-aware -> naive
+    except Exception:
+        # 혹시 tz_convert가 막히면 fallback
+        ts = ts.tz_localize(None)
+    return ts.normalize()
+
+
+def _to_naive_datetime_series(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="coerce")
+    # dt.dt.tz is None (tz-naive) or tz-aware
+    try:
+        if getattr(dt.dt, "tz", None) is not None:
+            return dt.dt.tz_convert(None)
+        return dt
+    except Exception:
+        # older pandas fallback
+        try:
+            return dt.dt.tz_localize(None)
+        except Exception:
+            return dt
+
+
+def _to_naive_datetime_index(idx: pd.Index) -> pd.DatetimeIndex:
+    dti = pd.to_datetime(idx, errors="coerce")
+    if not isinstance(dti, pd.DatetimeIndex):
+        dti = pd.DatetimeIndex(dti)
+    try:
+        if dti.tz is not None:
+            return dti.tz_convert(None)
+        return dti
+    except Exception:
+        try:
+            return dti.tz_localize(None)
+        except Exception:
+            return dti
 
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -41,6 +77,7 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
+        # yfinance multiindex 흔함: ('Open', '') 같은 형태
         df.columns = [str(c[0]).strip() for c in df.columns]
     else:
         df.columns = [str(c).strip() for c in df.columns]
@@ -71,7 +108,7 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
     if "Ticker" not in df.columns and "ticker" in df.columns:
         df = df.rename(columns={"ticker": "Ticker"})
 
-    # Adj Close normalize
+    # Adj Close normalize (가능한 케이스 다 받기)
     if "AdjClose" not in df.columns:
         if "Adj Close" in df.columns:
             df = df.rename(columns={"Adj Close": "AdjClose"})
@@ -84,10 +121,11 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
     if not needed.issubset(set(df.columns)):
         raise RuntimeError(f"[SCHEMA] Missing {needed - set(df.columns)}. Columns={list(df.columns)[:30]}")
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+    df = df.copy()
+    df["Date"] = _to_naive_datetime_series(df["Date"])
     df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
 
-    # numeric normalize (build_features 쪽에서 다시 coerce하긴 하는데 여기서도 정리)
+    # numeric normalize
     for c in ["Open", "High", "Low", "Close", "AdjClose", "Volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -102,7 +140,6 @@ def _normalize_enabled_col(s: pd.Series) -> pd.Series:
     x = s.copy()
     if x.dtype == bool:
         return x
-    # 문자열/숫자 혼합 대응
     x = x.astype(str).str.strip().str.lower()
     truthy = {"true", "1", "yes", "y", "t"}
     falsy = {"false", "0", "no", "n", "f", "", "nan", "none"}
@@ -153,17 +190,24 @@ def safe_download_one(
                 raise ValueError(f"Empty data for {ticker} (start={start}, end={end})")
 
             df = df.copy()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
+            df.index = _to_naive_datetime_index(df.index)
             df.index.name = "Date"
-
             df = _flatten_columns(df)
 
-            expected = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-            missing = [c for c in expected if c not in df.columns]
-            if missing:
-                raise ValueError(f"{ticker} missing columns: {missing} (cols={list(df.columns)})")
+            # yfinance는 보통 이 컬럼들이 오는데, 간헐적으로 Adj Close가 빠지거나
+            # 이름이 다르게 올 때가 있어 normalize_schema에서 재정리하긴 함.
+            expected_any = {"Open", "High", "Low", "Close", "Adj Close", "AdjClose", "Volume"}
+            if not any(c in df.columns for c in expected_any):
+                raise ValueError(f"{ticker} unexpected columns: {list(df.columns)}")
 
-            df = df[expected].rename(columns={"Adj Close": "AdjClose"}).reset_index()
+            # 가능하면 표준 6개로 맞춘다
+            if "Adj Close" in df.columns:
+                df = df.rename(columns={"Adj Close": "AdjClose"})
+            cols = [c for c in ["Open", "High", "Low", "Close", "AdjClose", "Volume"] if c in df.columns]
+            if len(cols) < 5:
+                raise ValueError(f"{ticker} missing too many OHLCV cols (cols={list(df.columns)})")
+
+            df = df[cols].reset_index()
             df.insert(1, "Ticker", ticker)
 
             return normalize_schema(df)
@@ -192,16 +236,21 @@ def save_prices(df: pd.DataFrame) -> str:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     df = normalize_schema(df)
 
+    # ✅ 앞으로 덜 터지게: parquet 성공해도 csv도 같이 저장
+    saved_to = None
     try:
         df.to_parquet(OUT_PARQUET, index=False)
-        return f"parquet:{OUT_PARQUET}"
+        saved_to = f"parquet:{OUT_PARQUET}"
     except Exception as e:
-        print(f"[WARN] Parquet save failed ({e}). Saving CSV fallback: {OUT_CSV_FALLBACK}")
-        df.to_csv(OUT_CSV_FALLBACK, index=False)
-        return f"csv:{OUT_CSV_FALLBACK}"
+        print(f"[WARN] Parquet save failed ({e}). Will rely on CSV: {OUT_CSV_FALLBACK}")
+
+    df.to_csv(OUT_CSV_FALLBACK, index=False)  # 항상 csv도 남김
+    if saved_to is None:
+        saved_to = f"csv:{OUT_CSV_FALLBACK}"
+    return saved_to
 
 
-def clamp_start_by_max_years(start: str | None, max_years: int) -> str | None:
+def clamp_start_by_max_years(start: str | None, max_years: int) -> str:
     """
     Clamp start to be no earlier than (today - max_years).
     If start is None or invalid, returns the clamp date string.
@@ -216,8 +265,17 @@ def clamp_start_by_max_years(start: str | None, max_years: int) -> str | None:
     sdt = pd.to_datetime(start, errors="coerce")
     if pd.isna(sdt):
         return min_start_str
-    if sdt.tzinfo is not None:
-        sdt = sdt.tz_localize(None)
+
+    # tz-aware면 naive로
+    try:
+        if getattr(sdt, "tzinfo", None) is not None:
+            sdt = pd.Timestamp(sdt).tz_convert(None)
+    except Exception:
+        try:
+            sdt = pd.Timestamp(sdt).tz_localize(None)
+        except Exception:
+            sdt = pd.Timestamp(sdt)
+
     if sdt.date() < min_start:
         return min_start_str
     return str(sdt.date())
@@ -233,7 +291,6 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--sleep-base", type=float, default=1.2)
     parser.add_argument("--include-extra", action="store_true", help="Include SPY and ^VIX for market features.")
-    # ✅ CHANGED: default now comes from env MAX_YEARS (fallback 11)
     parser.add_argument("--max-years", type=int, default=DEFAULT_MAX_YEARS, help="Limit raw price history to recent N years (default from env MAX_YEARS or 11).")
     args = parser.parse_args()
 
@@ -246,7 +303,7 @@ def main() -> None:
     today = _utc_today_normalized()
     min_start = (today - pd.Timedelta(days=int(args.max_years) * 365)).date()
     print(f"[INFO] max-years={args.max_years} -> clamp start >= {min_start}")
-    print(f"[INFO] tickers={len(tickers)} -> {tickers}")
+    print(f"[INFO] tickers={len(tickers)}")
 
     if args.reset:
         for p in [OUT_PARQUET, OUT_CSV_FALLBACK, META_JSON]:
@@ -274,7 +331,7 @@ def main() -> None:
                 if pd.isna(ld):
                     start = args.start
                 else:
-                    start_dt = (ld - pd.Timedelta(days=int(args.lookback_days))).date()
+                    start_dt = (pd.Timestamp(ld) - pd.Timedelta(days=int(args.lookback_days))).date()
                     start = args.start or str(start_dt)
 
             start = clamp_start_by_max_years(start, int(args.max_years))
@@ -287,7 +344,9 @@ def main() -> None:
                 sleep_base=float(args.sleep_base),
             )
             downloads.append(df_new)
-            print(f"[OK] {t}: {df_new['Date'].min().date()} -> {df_new['Date'].max().date()} rows={len(df_new)}")
+            dmin = pd.to_datetime(df_new["Date"].min(), errors="coerce")
+            dmax = pd.to_datetime(df_new["Date"].max(), errors="coerce")
+            print(f"[OK] {t}: {dmin.date() if not pd.isna(dmin) else '?'} -> {dmax.date() if not pd.isna(dmax) else '?'} rows={len(df_new)}")
 
         except Exception as e:
             failed.append((t, str(e)))
@@ -320,7 +379,7 @@ def main() -> None:
         "updated_at_utc": now_utc_iso(),
         "saved_to": saved_to,
         "tickers_requested": tickers,
-        "tickers_downloaded": sorted(set(new_all["Ticker"].unique().tolist())),
+        "tickers_downloaded": sorted(set(combined["Ticker"].unique().tolist())),
         "min_date": str(combined["Date"].min().date()) if not combined.empty else None,
         "max_date": str(combined["Date"].max().date()) if not combined.empty else None,
         "rows": int(len(combined)),
@@ -331,21 +390,17 @@ def main() -> None:
         "max_years": int(args.max_years),
     }
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    META_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    META_JSON.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"[DONE] saved={saved_to} rows={len(combined)} range={meta['min_date']}..{meta['max_date']}")
 
-    # NOTE:
-    # In truncated backtests (e.g., 2008~2014), many tickers may not have existed yet,
-    # and yfinance returns "Empty data". That's not a fatal error as long as we got
-    # enough tickers to proceed.
+    # Fail only when "too few" tickers succeeded (hard floor).
     ok = len(downloads)
     total = len(tickers)
-    
-    # Fail only when "too few" tickers succeeded (hard floor).
-    # (Before: failed >= half -> abort)
     min_ok = max(3, total // 4)  # require at least 25% (and at least 3 tickers)
     if ok < min_ok:
         raise RuntimeError(f"Too few tickers downloaded: ok={ok}/{total}, failed={len(failed)}")
+
+
 if __name__ == "__main__":
     main()

@@ -87,7 +87,22 @@ def compute_success_and_tau_for_ticker(
       Success = (profit hit within horizon) AND (stop NOT hit within horizon)
     TauDays  = first day index (1..horizon) profit hit, else NaN
 
-    Uses High/Low vs entry Close thresholds.
+    ✅ DCA(분할매수) + 평단(avg) 기반 라벨.
+
+    - 진입: i일 Close에서 1회 매수(평단=Close[i])
+    - DCA: i+1..i+H 동안 매일 Close에서 아래 규칙으로 추가매수(평단 갱신)
+        * close <= avg            : full buy (unit)
+        * avg < close <= avg*1.05 : half buy (unit/2)
+        * close > avg*1.05        : no buy
+      (엔진 simulate_single_position_engine.py 의 Normal mode DCA 규칙과 동일)
+
+    - 이벤트 판정 순서(보수적):
+        1) Stop (Low <= avg*(1+stop_level))
+        2) Profit (High >= avg*(1+profit_target))
+      같은 날 둘 다 터지면 Stop 우선.
+
+    - Success: Profit이 H일 내에 발생했고, 그 이전에 Stop이 없었을 때
+    - TauDays: Profit 최초 발생일(1..H)
     """
     g = g.sort_values("Date").reset_index(drop=True).copy()
 
@@ -99,30 +114,62 @@ def compute_success_and_tau_for_ticker(
     success = np.zeros(n, dtype=np.int8)
     tau = np.full(n, np.nan, dtype=float)
 
+    H = int(horizon_days)
     pt_mult = 1.0 + float(profit_target)
     sl_mult = 1.0 + float(stop_level)  # stop_level typically negative
 
+    # unit 투자금은 절대금액이 아니라 "비율"로 두면 결과가 평단/수익률 기준에서 불변.
+    # 엔진은 unit = seed/H 이고, 여기서는 seed=1로 정규화해서 unit=1/H.
+    unit = (1.0 / float(H)) if H > 0 else 0.0
+
     for i in range(n):
-        entry = close[i]
-        if not np.isfinite(entry) or entry <= 0:
+        entry_px = close[i]
+        if not np.isfinite(entry_px) or entry_px <= 0:
             continue
 
-        profit_px = entry * pt_mult
-        stop_px = entry * sl_mult
-
-        end = min(n, i + horizon_days + 1)  # scan i+1 .. end-1
+        # position state (normalized)
+        invested = 1.0
+        shares = invested / entry_px
 
         hit_profit_day: int | None = None
         hit_stop = False
 
-        for j in range(i + 1, end):
-            # conservative: if stop ever hit before profit, fail
+        end_main = min(n - 1, i + H)
+        for j in range(i + 1, end_main + 1):
+            if shares <= 0:
+                break
+
+            avg = invested / shares if shares > 0 else np.nan
+            if not np.isfinite(avg) or avg <= 0:
+                break
+
+            profit_px = avg * pt_mult
+            stop_px = avg * sl_mult
+
+            # 1) Stop first (conservative)
             if np.isfinite(low[j]) and low[j] <= stop_px:
                 hit_stop = True
                 break
+
+            # 2) Profit
             if np.isfinite(high[j]) and high[j] >= profit_px:
                 hit_profit_day = j
                 break
+
+            # 3) DCA buy at close (normal mode only, until H)
+            cpx = close[j]
+            if unit > 0 and np.isfinite(cpx) and cpx > 0:
+                buy = unit
+                if cpx <= avg:
+                    pass
+                elif cpx <= avg * 1.05:
+                    buy = buy / 2.0
+                else:
+                    buy = 0.0
+
+                if buy > 0:
+                    invested += buy
+                    shares += buy / cpx
 
         if hit_profit_day is not None and (not hit_stop):
             success[i] = 1

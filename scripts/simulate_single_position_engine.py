@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,20 @@ def read_table(parq: str, csv: str) -> pd.DataFrame:
 
 def _norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
+
+
+def _parse_bool(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _failfast_require_files(require_files: str) -> None:
+    req = [x.strip() for x in str(require_files or "").split(",") if x.strip()]
+    if not req:
+        return
+    missing = [p for p in req if not Path(p).exists()]
+    if missing:
+        print(f"[ERROR] Missing required files: {missing}")
+        raise SystemExit(2)
 
 
 def clamp_invest_by_leverage(seed: float, entry_seed: float, desired: float, max_leverage_pct: float) -> float:
@@ -82,7 +97,6 @@ class CycleState:
     grace_days_left: int = 0
     recovery_threshold: float = np.nan
     reval_strength: str = ""
-    # ✅ NEW: store ps/pt at re-eval time (so PASS cases can print ps/pt in Reason later)
     reval_ps: float = np.nan
     reval_pt: float = np.nan
 
@@ -91,22 +105,20 @@ class CycleState:
     max_equity: float = 0.0
     max_dd: float = 0.0
 
-    # ✅ A버전: TP1 한 번이라도 발생하면 사이클 끝날 때까지 DCA 전면 금지
+    # A-version flags
     dca_locked: bool = False
-
-    # ✅ 트레일링 진입(=첫 TP1 발생) 횟수: 사이클당 최대 1회
     trailing_started: bool = False
     trailing_entries: int = 0
-
-    # ✅ TP1 첫 발생 시점(holding day index) 기록 (기간제한용)
-    tp1_first_holding_day: int = 0  # 0 means "not set"
-
-    # ✅ 사이클 중 최대 수익률(마크투클로즈 기준): (Equity - S0) / S0 의 최대값
+    tp1_first_holding_day: int = 0
     cycle_max_return: float = np.nan
 
-    # ✅ FIX: 사이클 실현 수익률용 누적 (Invested/Proceeds가 0 되는 문제 방지)
-    cycle_buy_total: float = 0.0   # 사이클 동안 실제 매수 총액(현금 유출)
-    cycle_sell_total: float = 0.0  # 사이클 동안 실제 매도 총액(현금 유입)
+    # realized totals
+    cycle_buy_total: float = 0.0
+    cycle_sell_total: float = 0.0
+
+    # DCA control (cycle-level)
+    dca_add_count: int = 0
+    last_dca_holding_day: int = 0  # 0 means "never"
 
     legs: list[Leg] = None  # type: ignore
 
@@ -214,21 +226,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "Single-cycle engine with TopK(1~2), TP1 partial, trailing stop, leverage cap on ALL buys.\n"
-            "A-version additions:\n"
-            " - DCA is locked for the rest of the cycle once ANY TP1 happens (cycle-level lock).\n"
-            " - trailing entry count is max 1 per cycle (first TP1 only).\n"
-            " - CycleMaxReturn is tracked as max((Equity - S0)/S0) during the cycle.\n"
-            "Fixes:\n"
-            " - CycleReturn always numeric (uses cycle_buy_total / cycle_sell_total)\n"
-            " - Invested/Proceeds no longer become 0 just because legs were zeroed\n"
-            " - NEW: reset buy/sell totals at cycle start (hard reset to prevent residue)\n"
-            "NEW (period cap after TP1; stop-loss still NOT applied in engine):\n"
-            " - --tp1-hold-cap none|h2|total\n"
-            "   none : no extra cap after TP1 (legacy behavior)\n"
-            "   h2   : after first TP1, allow only +H//2 holding days then force close\n"
-            "   total: after first TP1, force close when holding_days >= H + H//2\n"
-            "NEW (tau mapping stabilization for fair comparison):\n"
-            " - --tau-h-map 30,40,50 (used when tau_H missing; or when only tau_class exists)\n"
+            "Workflow-compat hardened version.\n"
         )
     )
 
@@ -238,6 +236,8 @@ def main() -> None:
 
     ap.add_argument("--features-scored-parq", default="data/features/features_scored.parquet", type=str)
     ap.add_argument("--features-scored-csv", default="data/features/features_scored.csv", type=str)
+    # ✅ optional explicit features path (parquet/csv)
+    ap.add_argument("--features-path", default="", type=str)
 
     ap.add_argument("--initial-seed", default=40_000_000, type=float)
 
@@ -258,11 +258,16 @@ def main() -> None:
     ap.add_argument("--topk", default=1, type=int)
     ap.add_argument("--weights", default="1.0", type=str)
 
-    # ✅ NEW: period cap policy after TP1
     ap.add_argument("--tp1-hold-cap", default="none", type=str, choices=["none", "h2", "total"])
-
-    # ✅ NEW: tau class -> H mapping (fallback / stabilization)
     ap.add_argument("--tau-h-map", default="30,40,50", type=str)
+
+    # ✅ workflow compat flags
+    ap.add_argument("--use-tau-h", default="true", type=str)
+    ap.add_argument("--enable-dca", default="true", type=str)
+    ap.add_argument("--dca-max-adds", default=0, type=int, help="0 means unlimited (cycle-level DCA events)")
+    ap.add_argument("--dca-gap-days", default=1, type=int, help="minimum holding-day gap between DCA events")
+    ap.add_argument("--dca-trigger", default="legacy", type=str, help="currently only 'legacy' is supported")
+    ap.add_argument("--dca-add-frac", default=1.0, type=float, help="scale factor applied to DCA daily budget")
 
     # re-eval thresholds
     ap.add_argument("--reval-ps-strong", default=0.70, type=float)
@@ -274,14 +279,25 @@ def main() -> None:
     ap.add_argument("--suffix", default="", type=str)
     ap.add_argument("--out-dir", default="data/signals", type=str)
 
+    # ✅ NEW: fail-fast guard (like predict_gate)
+    ap.add_argument("--require-files", default="", type=str, help="comma-separated must-exist files; missing -> exit 2")
+
     args = ap.parse_args()
 
-    enable_trailing = str(args.enable_trailing).lower() in ("1", "true", "yes", "y")
-    _ = str(args.tp1_trail_unlimited).lower() in ("1", "true", "yes", "y")  # compat only
+    _failfast_require_files(args.require_files)
 
-    tp1_hold_cap = str(args.tp1_hold_cap).lower().strip()
-    if tp1_hold_cap not in ("none", "h2", "total"):
-        raise ValueError("--tp1-hold-cap must be one of: none|h2|total")
+    enable_trailing = _parse_bool(args.enable_trailing)
+    _ = _parse_bool(args.tp1_trail_unlimited)  # compat only
+    use_tau_h = _parse_bool(args.use_tau_h)
+    enable_dca = _parse_bool(args.enable_dca)
+
+    dca_max_adds = int(args.dca_max_adds)
+    dca_gap_days = int(max(1, args.dca_gap_days))
+    dca_add_frac = float(args.dca_add_frac)
+    dca_trigger = str(args.dca_trigger or "legacy").strip().lower()
+    if dca_trigger != "legacy":
+        print(f"[WARN] unsupported --dca-trigger={dca_trigger}. Falling back to 'legacy'.")
+        dca_trigger = "legacy"
 
     hmap = parse_tau_h_map(args.tau_h_map)
 
@@ -293,7 +309,27 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    feat_map = load_feat_map(args.features_scored_parq, args.features_scored_csv)
+    # features map
+    if args.features_path:
+        fp = Path(args.features_path)
+        if not fp.exists():
+            raise FileNotFoundError(f"--features-path not found: {fp}")
+        if fp.suffix.lower() == ".parquet":
+            tmp = pd.read_parquet(fp)
+        else:
+            tmp = pd.read_csv(fp)
+        # write temp into map loader form
+        if "Date" not in tmp.columns or "Ticker" not in tmp.columns:
+            feat_map = pd.DataFrame()
+        else:
+            tmp = tmp.copy()
+            tmp["Date"] = _norm_date(tmp["Date"])
+            tmp["Ticker"] = tmp["Ticker"].astype(str).str.upper().str.strip()
+            keep = [x for x in ["Date", "Ticker", "p_success", "p_tail", "tau_H", "tau_class"] if x in tmp.columns]
+            tmp = tmp[keep].dropna(subset=["Date", "Ticker"]).drop_duplicates(subset=["Date", "Ticker"]).reset_index(drop=True)
+            feat_map = tmp.set_index(["Date", "Ticker"], drop=True)
+    else:
+        feat_map = load_feat_map(args.features_scored_parq, args.features_scored_csv)
 
     picks_path = Path(args.picks_path)
     if not picks_path.exists():
@@ -335,11 +371,10 @@ def main() -> None:
     )
 
     cooldown_today = False
-    trades = []
-    curve = []
+    trades: list[dict] = []
+    curve: list[dict] = []
 
     def liquidate_all_legs(day_prices_close: dict[str, float]) -> float:
-        """Sell ALL remaining shares at close. Returns proceeds for the liquidation part only."""
         proceeds = 0.0
         for leg in st.legs:
             px = float(day_prices_close.get(leg.ticker, np.nan))
@@ -360,17 +395,10 @@ def main() -> None:
         invested_total = float(st.cycle_buy_total)
         proceeds_total = float(st.cycle_sell_total)
 
-        # ✅ always numeric
-        if invested_total > 0:
-            cycle_return = (proceeds_total - invested_total) / invested_total
-        else:
-            cycle_return = 0.0
-
+        cycle_return = (proceeds_total - invested_total) / invested_total if invested_total > 0 else 0.0
         win = int(cycle_return > 0)
-
         cmr = float(st.cycle_max_return) if np.isfinite(st.cycle_max_return) else np.nan
 
-        # cap days info (for audit)
         H_half = int(max(1, int(st.H) // 2)) if int(st.H) > 0 else 0
         total_cap = int(st.H + H_half) if int(st.H) > 0 else 0
         tp1_cap = int(H_half) if int(st.H) > 0 else 0
@@ -390,12 +418,13 @@ def main() -> None:
             "StopLevelInput": float(args.stop_level),
             "MaxExtendDaysInput": int(args.max_extend_days),
 
-            "TP1HoldCapMode": tp1_hold_cap,
+            "TP1HoldCapMode": str(args.tp1_hold_cap),
             "TP1HoldCapDays": tp1_cap,
             "TotalHoldCapDays": total_cap,
             "TP1FirstHoldingDay": int(st.tp1_first_holding_day),
 
             "TauHMap": ",".join([str(x) for x in hmap]),
+            "UseTauH": int(use_tau_h),
 
             "GraceDays": int(st.grace_days_total),
             "RevalStrength": st.reval_strength,
@@ -414,8 +443,14 @@ def main() -> None:
             "MaxDrawdown": st.max_dd,
             "Win": win,
 
-            "TrailingEntries": int(st.trailing_entries),   # 0/1 per cycle
+            "TrailingEntries": int(st.trailing_entries),
             "DcaLocked": int(st.dca_locked),
+
+            "EnableDCA": int(enable_dca),
+            "DcaMaxAdds": int(dca_max_adds),
+            "DcaGapDays": int(dca_gap_days),
+            "DcaAddFrac": float(dca_add_frac),
+            "DcaAddsUsed": int(st.dca_add_count),
         })
 
         st.seed += float(liq_proceeds)
@@ -441,16 +476,17 @@ def main() -> None:
         st.max_leverage_pct = 0.0
         st.legs = []
 
-        # ✅ reset A-version flags
         st.dca_locked = False
         st.trailing_started = False
         st.trailing_entries = 0
         st.tp1_first_holding_day = 0
         st.cycle_max_return = np.nan
 
-        # ✅ reset realized totals for next cycle
         st.cycle_buy_total = 0.0
         st.cycle_sell_total = 0.0
+
+        st.dca_add_count = 0
+        st.last_dca_holding_day = 0
 
         cooldown_today = True
 
@@ -483,18 +519,13 @@ def main() -> None:
         return "FAIL", ps_m, pt_m
 
     def should_force_close_after_tp1() -> tuple[bool, str]:
-        """
-        Apply cap only AFTER at least one TP1 in the cycle.
-        - none : never force close due to cap
-        - h2   : if holding_days >= (tp1_first_holding_day + H//2)
-        - total: if holding_days >= (H + H//2)
-        """
         if not st.in_cycle:
             return False, ""
+        tp1_hold_cap = str(args.tp1_hold_cap).lower().strip()
         if tp1_hold_cap == "none":
             return False, ""
         if st.tp1_first_holding_day <= 0:
-            return False, ""  # no TP1 yet
+            return False, ""
 
         H = int(st.H)
         if H <= 0:
@@ -557,7 +588,6 @@ def main() -> None:
                     else:
                         st.recovery_threshold = float(min(base, -0.05))
 
-            # if closed by reval, skip rest
             if st.in_cycle:
                 # 1) TP1 + trailing per leg
                 if enable_trailing:
@@ -568,7 +598,6 @@ def main() -> None:
                         low_px = day_prices_low[leg.ticker]
                         avg = leg.avg_price()
 
-                        # TP1 event
                         if (not leg.tp1_done) and np.isfinite(avg) and high_px >= avg * (1.0 + float(args.profit_target)):
                             tp_px = avg * (1.0 + float(args.profit_target))
                             sell_shares = leg.shares * float(args.tp1_frac)
@@ -588,17 +617,14 @@ def main() -> None:
                             leg.tp1_done = True
                             leg.peak = float(max(high_px, tp_px))
 
-                            # first TP1 => trailing starts + DCA lock
                             if not st.trailing_started:
                                 st.trailing_started = True
                                 st.trailing_entries = 1
-                                # ✅ record TP1 first day index for cap policy
                                 st.tp1_first_holding_day = int(st.holding_days)
 
                             st.dca_locked = True
                             st.update_lev(float(args.max_leverage_pct))
 
-                        # trailing after TP1
                         if leg.tp1_done and leg.shares > 0:
                             if high_px > leg.peak:
                                 leg.peak = float(high_px)
@@ -614,7 +640,7 @@ def main() -> None:
                 if st.in_cycle and all((leg.shares <= 0 for leg in st.legs)):
                     close_cycle(date, day_prices_close, reason="TRAIL_EXIT_ALL")
 
-            # ✅ 2.5) TP1-period cap (only after at least one TP1)
+            # 2.5) TP1-period cap
             if st.in_cycle:
                 force, why = should_force_close_after_tp1()
                 if force:
@@ -627,7 +653,7 @@ def main() -> None:
                     st.ret_H = compute_cycle_return_today(st, day_prices_close)
                     st.pending_reval = True
 
-            # 4) Grace mode: DCA STOP anyway; apply recovery-stop only if NO TP1 anywhere
+            # 4) Grace mode (no TP1 case only)
             if st.in_cycle and st.extending:
                 any_tp1 = any((leg.tp1_done for leg in st.legs))
                 if not any_tp1:
@@ -636,9 +662,7 @@ def main() -> None:
                     thr = float(st.recovery_threshold) if np.isfinite(st.recovery_threshold) else -0.05
                     hit = False
                     for leg in st.legs:
-                        if leg.shares <= 0:
-                            continue
-                        if leg.tp1_done:
+                        if leg.shares <= 0 or leg.tp1_done:
                             continue
                         px = day_prices_close.get(leg.ticker, np.nan)
                         avg = leg.avg_price()
@@ -666,37 +690,50 @@ def main() -> None:
                     st.update_dd(day_prices_close)
                     st.update_cycle_max_return(day_prices_close)
 
-            # 5) Normal mode DCA
+            # 5) Normal mode DCA (optional)
             if st.in_cycle and (not st.extending) and (not st.pending_reval):
-                if not st.dca_locked:
-                    desired_total = float(st.unit)
-                    for leg in st.legs:
-                        if leg.ticker not in day_df.index:
-                            continue
-                        close_px = day_prices_close[leg.ticker]
-                        if not np.isfinite(close_px) or close_px <= 0:
-                            continue
+                if enable_dca and (not st.dca_locked):
+                    if dca_max_adds > 0 and st.dca_add_count >= dca_max_adds:
+                        pass
+                    else:
+                        if st.last_dca_holding_day > 0 and (st.holding_days - st.last_dca_holding_day) < dca_gap_days:
+                            pass
+                        else:
+                            desired_total = float(st.unit) * float(max(0.0, dca_add_frac))
+                            any_invest = False
 
-                        avg = leg.avg_price()
-                        desired_leg = desired_total * float(leg.weight)
+                            for leg in st.legs:
+                                if leg.ticker not in day_df.index:
+                                    continue
+                                close_px = day_prices_close[leg.ticker]
+                                if not np.isfinite(close_px) or close_px <= 0:
+                                    continue
 
-                        if np.isfinite(avg) and avg > 0:
-                            if close_px <= avg:
-                                pass
-                            elif close_px <= avg * 1.05:
-                                desired_leg = desired_leg / 2.0
-                            else:
-                                desired_leg = 0.0
+                                avg = leg.avg_price()
+                                desired_leg = desired_total * float(leg.weight)
 
-                        invest = clamp_invest_by_leverage(
-                            st.seed, st.entry_seed, desired_leg, float(args.max_leverage_pct)
-                        )
-                        if invest > 0:
-                            st.seed -= invest
-                            st.cycle_buy_total += float(invest)
-                            leg.invested += invest
-                            leg.shares += invest / close_px
-                            st.update_lev(float(args.max_leverage_pct))
+                                if np.isfinite(avg) and avg > 0:
+                                    if close_px <= avg:
+                                        pass
+                                    elif close_px <= avg * 1.05:
+                                        desired_leg = desired_leg / 2.0
+                                    else:
+                                        desired_leg = 0.0
+
+                                invest = clamp_invest_by_leverage(
+                                    st.seed, st.entry_seed, desired_leg, float(args.max_leverage_pct)
+                                )
+                                if invest > 0:
+                                    st.seed -= invest
+                                    st.cycle_buy_total += float(invest)
+                                    leg.invested += invest
+                                    leg.shares += invest / close_px
+                                    st.update_lev(float(args.max_leverage_pct))
+                                    any_invest = True
+
+                            if any_invest:
+                                st.dca_add_count += 1
+                                st.last_dca_holding_day = int(st.holding_days)
 
                 st.update_dd(day_prices_close)
                 st.update_cycle_max_return(day_prices_close)
@@ -709,34 +746,34 @@ def main() -> None:
                 if len(valid) >= 1:
                     chosen = valid[:topk]
 
-                    # ✅ decide H from features_scored:
-                    #   1) tau_H (preferred)
-                    #   2) tau_class -> tau-h-map
-                    #   3) fallback to middle of hmap (default 40)
-                    Hs = []
-                    if not feat_map.empty:
-                        for t in chosen:
-                            try:
-                                row = feat_map.loc[(date, t)]
-                                if "tau_H" in row.index:
-                                    hh = int(row["tau_H"])
-                                    if hh > 0:
-                                        Hs.append(hh)
-                                elif "tau_class" in row.index:
-                                    cls = int(row["tau_class"])
-                                    hh = int(class_to_h(cls, hmap))
-                                    if hh > 0:
-                                        Hs.append(hh)
-                            except Exception:
-                                pass
+                    if not use_tau_h:
+                        H_eff = int(max(1, int(args.max_days)))
+                    else:
+                        Hs: list[int] = []
+                        if not feat_map.empty:
+                            for t in chosen:
+                                try:
+                                    row = feat_map.loc[(date, t)]
+                                    if "tau_H" in row.index:
+                                        hh = int(row["tau_H"])
+                                        if hh > 0:
+                                            Hs.append(hh)
+                                    elif "tau_class" in row.index:
+                                        cls = int(row["tau_class"])
+                                        hh = int(class_to_h(cls, hmap))
+                                        if hh > 0:
+                                            Hs.append(hh)
+                                except Exception:
+                                    pass
 
-                    fallback_H = int(hmap[1] if len(hmap) >= 2 else (hmap[0] if hmap else 40))
-                    H_eff = int(max(Hs)) if Hs else int(fallback_H)
-                    H_eff = int(max(1, H_eff))
+                        fallback_H = int(hmap[1] if len(hmap) >= 2 else (hmap[0] if hmap else 40))
+                        H_eff = int(max(Hs)) if Hs else int(fallback_H)
+                        H_eff = int(max(1, H_eff))
 
-                    # ✅ HARD RESET totals right before starting a new cycle
                     st.cycle_buy_total = 0.0
                     st.cycle_sell_total = 0.0
+                    st.dca_add_count = 0
+                    st.last_dca_holding_day = 0
 
                     S0 = float(st.seed)
                     unit = (S0 / float(H_eff)) if H_eff > 0 else 0.0
@@ -776,7 +813,6 @@ def main() -> None:
                         st.max_leverage_pct = 0.0
                         st.legs = legs
 
-                        # reset A-version stats
                         st.dca_locked = False
                         st.trailing_started = False
                         st.trailing_entries = 0
@@ -810,12 +846,16 @@ def main() -> None:
             "DcaLocked": int(st.dca_locked) if st.in_cycle else 0,
             "TrailingEntriesCycle": int(st.trailing_entries) if st.in_cycle else 0,
             "TP1FirstHoldingDay": int(st.tp1_first_holding_day) if st.in_cycle else 0,
-            "TP1HoldCapMode": tp1_hold_cap if st.in_cycle else "",
+            "TP1HoldCapMode": str(args.tp1_hold_cap) if st.in_cycle else "",
 
             "CycleMaxReturnSoFar": float(st.cycle_max_return) if (st.in_cycle and np.isfinite(st.cycle_max_return)) else np.nan,
 
             "CycleBuyTotal": float(st.cycle_buy_total) if st.in_cycle else 0.0,
             "CycleSellTotal": float(st.cycle_sell_total) if st.in_cycle else 0.0,
+
+            "UseTauH": int(use_tau_h),
+            "EnableDCA": int(enable_dca),
+            "DcaAddsUsed": int(st.dca_add_count) if st.in_cycle else 0,
         })
 
         # ----- force close on last day
@@ -832,13 +872,22 @@ def main() -> None:
 
     trades_path = Path(args.out_dir) / f"sim_engine_trades_{tag}_gate_{suffix}.parquet"
     curve_path = Path(args.out_dir) / f"sim_engine_curve_{tag}_gate_{suffix}.parquet"
+
     trades_df.to_parquet(trades_path, index=False)
     curve_df.to_parquet(curve_path, index=False)
 
+    trades_csv_path = trades_path.with_suffix(".csv")
+    curve_csv_path = curve_path.with_suffix(".csv")
+    trades_df.to_csv(trades_csv_path, index=False)
+    curve_df.to_csv(curve_csv_path, index=False)
+
     print(f"[DONE] wrote trades: {trades_path} rows={len(trades_df)}")
+    print(f"[DONE] wrote trades: {trades_csv_path} rows={len(trades_df)}")
     print(f"[DONE] wrote curve : {curve_path} rows={len(curve_df)}")
+    print(f"[DONE] wrote curve : {curve_csv_path} rows={len(curve_df)}")
     if not curve_df.empty:
-        print(f"[INFO] final SeedMultiple={float(curve_df['SeedMultiple'].iloc[-1]):.4f} maxDD={float(st.max_dd):.4f}")
+        last_sm = float(curve_df["SeedMultiple"].iloc[-1])
+        print(f"[INFO] final SeedMultiple={last_sm:.4f} maxDD={float(st.max_dd):.4f}")
 
 
 if __name__ == "__main__":

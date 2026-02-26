@@ -146,9 +146,22 @@ def compute_trade_path(
     max_extend_days: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
+    ✅ DCA(분할매수) + 평단(avg) 기반 tail 라벨.
+
     Tail definition:
-      - If SL hit first within H, and then TP is reached within extension window => p_tail=1
-      - else p_tail=0
+      - H일 내에 SL이 먼저 발생했고,
+      - 그 이후 (H + EX) 윈도우 안에서 TP가 다시 발생하면 p_tail=1
+      - 그 외는 0
+
+    DCA 규칙(엔진 simulate_single_position_engine.py 와 동일):
+      - 진입: i일 Close에서 1회 매수
+      - i+1..i+H 동안 매일 Close에서:
+          * close <= avg            : full buy (unit)
+          * avg < close <= avg*1.05 : half buy (unit/2)
+          * close > avg*1.05        : no buy
+      - EX 구간에서는 추가매수 없음(DCA stop)
+
+    이벤트 판정(보수적): 같은 날 SL/TP 둘 다면 SL 우선.
 
     Returns:
       y_tail (0/1)
@@ -156,6 +169,8 @@ def compute_trade_path(
     """
     g = g.sort_values("Date").reset_index(drop=True)
     close = pd.to_numeric(g["Close"], errors="coerce").to_numpy(dtype=float)
+    high = pd.to_numeric(g["High"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(g["Low"], errors="coerce").to_numpy(dtype=float)
 
     n = len(g)
     y_tail = np.zeros(n, dtype=int)
@@ -163,48 +178,126 @@ def compute_trade_path(
 
     H = int(max_days)
     EX = int(max_extend_days)
+    pt_mult = 1.0 + float(profit_target)
+    sl_mult = 1.0 + float(stop_level)
+    unit = (1.0 / float(H)) if H > 0 else 0.0
 
     for i in range(n):
         if i + 1 >= n:
             continue
-        entry = close[i]
-        if not np.isfinite(entry) or entry <= 0:
+        entry_px = close[i]
+        if not np.isfinite(entry_px) or entry_px <= 0:
             continue
 
-        end_main = min(n - 1, i + H)
-        win = close[i + 1 : end_main + 1]
+        invested = 1.0
+        shares = invested / entry_px
 
-        tp_hit = None
-        sl_hit = None
-        for j, px in enumerate(win, start=1):
-            ret = (px / entry) - 1.0
-            if tp_hit is None and ret >= profit_target:
-                tp_hit = i + j
-            if sl_hit is None and ret <= stop_level:
-                sl_hit = i + j
-            if tp_hit is not None or sl_hit is not None:
+        sl_hit_day: int | None = None
+        tp_hit_day: int | None = None
+
+        end_main = min(n - 1, i + H)
+        end_ext = min(n - 1, end_main + EX)
+
+        # scan main window first to find which event happens first (SL vs TP)
+        for j in range(i + 1, end_main + 1):
+            if shares <= 0:
                 break
 
-        end_ext = min(n - 1, end_main + EX)
-        win_ext = close[i + 1 : end_ext + 1]
-        if len(win_ext) > 0:
-            y_pmax[i] = float(np.nanmax((win_ext / entry) - 1.0))
+            avg = invested / shares if shares > 0 else np.nan
+            if not np.isfinite(avg) or avg <= 0:
+                break
 
-        # already success or no event: tail=0
-        if tp_hit is None and sl_hit is None:
+            # diagnostic pmax uses intraday high vs current avg
+            if np.isfinite(high[j]) and high[j] > 0:
+                r = (high[j] / avg) - 1.0
+                if np.isfinite(r):
+                    y_pmax[i] = float(np.nanmax([y_pmax[i], r])) if np.isfinite(y_pmax[i]) else float(r)
+
+            stop_px = avg * sl_mult
+            prof_px = avg * pt_mult
+
+            # SL first (conservative)
+            if np.isfinite(low[j]) and low[j] <= stop_px:
+                sl_hit_day = j
+                break
+
+            # TP
+            if np.isfinite(high[j]) and high[j] >= prof_px:
+                tp_hit_day = j
+                break
+
+            # DCA buy at close (until H)
+            cpx = close[j]
+            if unit > 0 and np.isfinite(cpx) and cpx > 0:
+                buy = unit
+                if cpx <= avg:
+                    pass
+                elif cpx <= avg * 1.05:
+                    buy = buy / 2.0
+                else:
+                    buy = 0.0
+
+                if buy > 0:
+                    invested += buy
+                    shares += buy / cpx
+
+        # if TP first or no event in main -> tail=0
+        if tp_hit_day is not None or sl_hit_day is None:
             y_tail[i] = 0
-        elif tp_hit is not None and (sl_hit is None or tp_hit <= sl_hit):
-            y_tail[i] = 0
+
+            # still fill pmax over remaining window for diagnostics
+            # (continue sim to end_ext to compute pmax, including DCA until end_main)
+            cur_j = (tp_hit_day if tp_hit_day is not None else end_main)
         else:
-            # SL first -> check recovery to TP within extension
+            # SL first -> keep simulating until end_ext to see if TP recovers
             recovered = False
-            start = (sl_hit + 1) if sl_hit is not None else (end_main + 1)
-            if start <= end_ext:
-                for k in range(start, end_ext + 1):
-                    if ((close[k] / entry) - 1.0) >= profit_target:
-                        recovered = True
-                        break
+            cur_j = sl_hit_day
+
+            for k in range(cur_j + 1, end_ext + 1):
+                if shares <= 0:
+                    break
+
+                avg = invested / shares if shares > 0 else np.nan
+                if not np.isfinite(avg) or avg <= 0:
+                    break
+
+                # pmax update
+                if np.isfinite(high[k]) and high[k] > 0:
+                    r = (high[k] / avg) - 1.0
+                    if np.isfinite(r):
+                        y_pmax[i] = float(np.nanmax([y_pmax[i], r])) if np.isfinite(y_pmax[i]) else float(r)
+
+                prof_px = avg * pt_mult
+                if np.isfinite(high[k]) and high[k] >= prof_px:
+                    recovered = True
+                    break
+
+                # DCA only until end_main
+                if k <= end_main:
+                    cpx = close[k]
+                    if unit > 0 and np.isfinite(cpx) and cpx > 0:
+                        buy = unit
+                        if cpx <= avg:
+                            pass
+                        elif cpx <= avg * 1.05:
+                            buy = buy / 2.0
+                        else:
+                            buy = 0.0
+
+                        if buy > 0:
+                            invested += buy
+                            shares += buy / cpx
+
             y_tail[i] = 1 if recovered else 0
+
+        # if pmax never set, compute from close path as fallback (for stability)
+        if not np.isfinite(y_pmax[i]):
+            # cheap fallback: use close over the whole window vs entry avg
+            win = close[i + 1 : end_ext + 1]
+            if len(win) > 0 and np.isfinite(entry_px) and entry_px > 0:
+                y_pmax[i] = float(np.nanmax((win / entry_px) - 1.0))
+            else:
+                y_pmax[i] = np.nan
 
     return y_tail, y_pmax
 

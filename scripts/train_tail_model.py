@@ -76,6 +76,10 @@ def main() -> None:
     ap.add_argument("--stop-level", type=float, required=True)
     ap.add_argument("--max-extend-days", type=int, required=True)
 
+    # ✅ NEW: allow workflow to save per-tag models
+    ap.add_argument("--out-model", type=str, default="", help="default: app/tail_model_{tag}.pkl")
+    ap.add_argument("--out-scaler", type=str, default="", help="default: app/tail_scaler_{tag}.pkl")
+
     ap.add_argument("--train-ratio", type=float, default=0.8)
     ap.add_argument("--max-iter", type=int, default=800)
 
@@ -163,10 +167,20 @@ def main() -> None:
     ll = float(log_loss(y_test, np.vstack([1 - proba, proba]).T, labels=[0, 1]))
 
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    model_path = APP_DIR / "tail_model.pkl"
-    scaler_path = APP_DIR / "tail_scaler.pkl"
+
+    model_path = Path(args.out_model.strip() or str(APP_DIR / f"tail_model_{tag}.pkl"))
+    scaler_path = Path(args.out_scaler.strip() or str(APP_DIR / f"tail_scaler_{tag}.pkl"))
+
     joblib.dump(model, model_path)
     joblib.dump(scaler, scaler_path)
+
+    # ✅ Compatibility: also refresh untagged defaults used by older code
+    try:
+        joblib.dump(model, APP_DIR / "tail_model.pkl")
+        joblib.dump(scaler, APP_DIR / "tail_scaler.pkl")
+        print("[INFO] also wrote compatibility copies: app/tail_model.pkl / app/tail_scaler.pkl")
+    except Exception as e:
+        print(f"[WARN] failed to write compatibility copies: {e}")
 
     report = {
         "tag": tag,

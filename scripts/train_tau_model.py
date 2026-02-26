@@ -343,8 +343,9 @@ def main() -> None:
     test_ll = float(log_loss(y_test, test_proba, labels=[0, 1, 2]))
 
     # outputs
-    out_model = Path(args.out_model) if args.out_model else (APP_DIR / "tau_model.pkl")
-    out_scaler = Path(args.out_scaler) if args.out_scaler else (APP_DIR / "tau_scaler.pkl")
+    # outputs (tagged 저장)
+    out_model = Path(args.out_model) if args.out_model else (APP_DIR / f"tau_model_{tag}.pkl")
+    out_scaler = Path(args.out_scaler) if args.out_scaler else (APP_DIR / f"tau_scaler_{tag}.pkl")
     out_model.parent.mkdir(parents=True, exist_ok=True)
     out_scaler.parent.mkdir(parents=True, exist_ok=True)
 

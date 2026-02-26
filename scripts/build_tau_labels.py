@@ -41,8 +41,18 @@ def compute_tau_days_for_ticker(
     max_days: int,
 ) -> pd.DataFrame:
     """
-    For each row (Date), compute earliest day d in [1..max_days] such that
-    future High (within d days ahead) >= entry_close*(1+profit_target).
+    ✅ DCA(분할매수) + 평단(avg) 기반 TauDays.
+
+    For each row (Date), simulate the single-ticker DCA strategy and compute
+    earliest day d in [1..max_days] such that
+      intraday High >= current_avg*(1+profit_target).
+
+    DCA rule (same as simulate_single_position_engine.py Normal mode DCA):
+      - entry at day i close (1.0 invested, avg=close[i])
+      - for days i+1..i+H, buy at close with:
+          * close <= avg            : full buy (unit)
+          * avg < close <= avg*1.05 : half buy (unit/2)
+          * close > avg*1.05        : no buy
 
     Returns: Date, Ticker, TauDays(float), SuccessWithinMaxDays(int)
     Note: day 1 means "next day". (same-day fill not counted)
@@ -58,22 +68,47 @@ def compute_tau_days_for_ticker(
     tau = np.full(n, np.nan, dtype=float)
     success = np.zeros(n, dtype=int)
 
-    pt = float(profit_target)
-    target = close0 * (1.0 + pt)
+    H = int(max_days)
+    pt_mult = 1.0 + float(profit_target)
+    unit = (1.0 / float(H)) if H > 0 else 0.0
 
     for i in range(n):
-        if not np.isfinite(close0[i]) or close0[i] <= 0:
+        entry_px = close0[i]
+        if not np.isfinite(entry_px) or entry_px <= 0:
             continue
 
-        thr = target[i]
-        end = min(n - 1, i + int(max_days))
+        invested = 1.0
+        shares = invested / entry_px
 
-        # scan forward days 1..max_days (i+1..end)
-        for j in range(i + 1, end + 1):
+        end_main = min(n - 1, i + H)
+        for j in range(i + 1, end_main + 1):
+            if shares <= 0:
+                break
+
+            avg = invested / shares if shares > 0 else np.nan
+            if not np.isfinite(avg) or avg <= 0:
+                break
+
+            thr = avg * pt_mult
             if np.isfinite(high[j]) and high[j] >= thr:
                 tau[i] = float(j - i)
                 success[i] = 1
                 break
+
+            # DCA buy at close
+            cpx = close0[j]
+            if unit > 0 and np.isfinite(cpx) and cpx > 0:
+                buy = unit
+                if cpx <= avg:
+                    pass
+                elif cpx <= avg * 1.05:
+                    buy = buy / 2.0
+                else:
+                    buy = 0.0
+
+                if buy > 0:
+                    invested += buy
+                    shares += buy / cpx
 
     out = pd.DataFrame(
         {
