@@ -33,17 +33,17 @@ on:
       P_TAIL_THRESHOLDS:
         description: "P_TAIL_THRESHOLDS (e.g. 0.10,0.20,0.30)"
         required: true
-        default: "0.10,0.20,0.30"
+        default: "0.05,0.40,0.70"
 
       UTILITY_QUANTILES:
         description: "UTILITY_QUANTILES (e.g. 0.60,0.75,0.90)"
         required: true
-        default: "0.60,0.70,0.80"
+        default: "0.40,0.80,0.95"
 
       PS_MINS:
         description: "PS_MINS (e.g. 0.00,0.60,0.70)"
         required: true
-        default: "0.50,0.60,0.70"
+        default: "0.00,0.70,0.85"
 
       TRAIL_STOPS:
         description: "TRAIL_STOPS (e.g. 0.10,0.12)"
@@ -58,12 +58,12 @@ on:
       BADEXIT_MAXES:
         description: "BADEXIT_MAXES (e.g. 1.00,0.50,0.30)"
         required: true
-        default: "1.00,0.50,0.30"
+        default: "1.00,0.30,0.10"
 
       LAMBDA_TAIL:
         description: "tail lambda weight (e.g. 1.00)"
         required: true
-        default: "1.00"
+        default: "0.00,1.00"
 
       GATE_MODES:
         description: "GATE_MODES (e.g. tail_utility,tail_only)"
@@ -383,7 +383,7 @@ jobs:
           LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
           GATE_MODES: ${{ inputs.GATE_MODES }}
           
-          RANK_METRICS: "p_success"
+          RANK_METRICS: "utility,p_success"
           
           ENABLE_TRAILING: "true"
           TOPK_CONFIGS: "1|1.0"
