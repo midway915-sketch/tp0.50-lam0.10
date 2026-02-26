@@ -1,0 +1,1122 @@
+name: walkforward-halfyear
+
+on:
+  workflow_dispatch:
+    inputs:
+      wf_start:
+        description: "first half-year (e.g. 2018H1)"
+        required: true
+        default: "2012H1"
+      wf_end:
+        description: "last half-year (e.g. 2025H2)"
+        required: true
+        default: "2025H2"
+      train_years:
+        description: "train window in years (e.g. 12)"
+        required: true
+        default: "15"
+
+      PROFIT_TARGET:
+        description: "profit target (e.g. 0.10)"
+        required: true
+        default: "0.10"
+      MAX_DAYS:
+        description: "max holding days H"
+        required: true
+        default: "40"
+      STOP_LEVEL:
+        description: "stop level"
+        required: true
+        default: "-0.10"
+
+      # ---- GRID PARAMS ----
+      P_TAIL_THRESHOLDS:
+        description: "P_TAIL_THRESHOLDS (e.g. 0.10,0.20,0.30)"
+        required: true
+        default: "0.10,0.20,0.30"
+
+      UTILITY_QUANTILES:
+        description: "UTILITY_QUANTILES (e.g. 0.60,0.75,0.90)"
+        required: true
+        default: "0.60,0.70,0.80"
+
+      PS_MINS:
+        description: "PS_MINS (e.g. 0.00,0.60,0.70)"
+        required: true
+        default: "0.50,0.60,0.70"
+
+      TRAIL_STOPS:
+        description: "TRAIL_STOPS (e.g. 0.10,0.12)"
+        required: true
+        default: "0.10"
+
+      TP1_FRAC:
+        description: "TP1_FRAC (e.g. 0.50,0.70)"
+        required: true
+        default: "1.00"
+
+      BADEXIT_MAXES:
+        description: "BADEXIT_MAXES (e.g. 1.00,0.50,0.30)"
+        required: true
+        default: "1.00,0.50,0.30"
+
+      LAMBDA_TAIL:
+        description: "tail lambda weight (e.g. 1.00)"
+        required: true
+        default: "1.00"
+
+      GATE_MODES:
+        description: "GATE_MODES (e.g. tail_utility,tail_only)"
+        required: true
+        default: "tail_utility"
+
+jobs:
+  raw-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install deps (raw-data)
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U yfinance pandas pyarrow
+
+      - name: Build universe.csv (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating via scripts/universe.py"
+            python scripts/universe.py
+          fi
+          test -f data/universe.csv
+
+      - name: Fetch raw prices (Yahoo)
+        env:
+          MAX_YEARS: "16"
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw
+          python scripts/fetch_prices.py --include-extra
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+
+      - name: Upload artifact raw-data
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+          if-no-files-found: error
+
+  build-features:
+    needs: [raw-data]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install deps (features)
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U pandas pyarrow
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Ensure universe.csv (from raw if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if [ ! -f data/universe.csv ]; then
+            echo "[INFO] data/universe.csv missing -> generating from raw prices"
+            python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          
+          raw_parq = Path("data/raw/prices.parquet")
+          raw_csv  = Path("data/raw/prices.csv")
+          
+          if raw_parq.exists():
+              df = pd.read_parquet(raw_parq)
+          elif raw_csv.exists():
+              df = pd.read_csv(raw_csv)
+          else:
+              raise SystemExit("[ERROR] raw prices missing")
+          
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
+          
+          ticks = (
+              df["Ticker"].astype(str).str.upper().str.strip()
+                .dropna().unique().tolist()
+          )
+          ticks = sorted(set([t for t in ticks if t]))
+          
+          out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+          Path("data").mkdir(parents=True, exist_ok=True)
+          out.to_csv("data/universe.csv", index=False)
+          print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+          PY
+          fi
+          test -f data/universe.csv
+
+      - name: Build features once (full history)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/features data/meta
+          python scripts/build_features.py
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+
+      - name: Upload artifact features-base
+        uses: actions/upload-artifact@v4
+        with:
+          name: features-base
+          path: |
+            data/features
+            data/meta
+            data/universe.csv
+          if-no-files-found: error
+
+  make-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Generate half-year matrix JSON
+        id: gen
+        shell: bash
+        run: |
+          python - <<'PY' > /tmp/matrix.json
+          import json, re
+          from datetime import date, timedelta
+          
+          wf_start = "${{ inputs.wf_start }}".strip()
+          wf_end   = "${{ inputs.wf_end }}".strip()
+          train_years = int("${{ inputs.train_years }}")
+          
+          m = re.fullmatch(r"(\d{4})H([12])", wf_start)
+          n = re.fullmatch(r"(\d{4})H([12])", wf_end)
+          if not m or not n:
+              raise SystemExit("wf_start/wf_end must be like 2018H1")
+          
+          sy, sh = int(m.group(1)), int(m.group(2))
+          ey, eh = int(n.group(1)), int(n.group(2))
+          
+          def half_start(y,h): return date(y,1,1) if h==1 else date(y,7,1)
+          def half_end(y,h):   return date(y,6,30) if h==1 else date(y,12,31)
+          
+          items=[]
+          y,h=sy,sh
+          while True:
+              period=f"{y}H{h}"
+              test_start=half_start(y,h); test_end=half_end(y,h)
+              vy,vh=(y-1,2) if h==1 else (y,1)
+              valid_start=half_start(vy,vh); valid_end=half_end(vy,vh)
+              train_end=valid_start - timedelta(days=1)
+              train_start=date(train_end.year-train_years+1, train_end.month, train_end.day)
+              cut_date=valid_end
+              items.append({
+                  "period":period,
+                  "TRAIN_START":train_start.isoformat(),
+                  "TRAIN_END":train_end.isoformat(),
+                  "VALID_START":valid_start.isoformat(),
+                  "VALID_END":valid_end.isoformat(),
+                  "TEST_START":test_start.isoformat(),
+                  "TEST_END":test_end.isoformat(),
+                  "CUT_DATE":cut_date.isoformat(),
+              })
+              if y==ey and h==eh: break
+              if h==1: h=2
+              else: y+=1; h=1
+          
+          print(json.dumps({"include":items}, ensure_ascii=False))
+          PY
+
+          echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/matrix.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  wf1-parallel:
+    name: wf1-parallel (Gate/Tail/Tau + Walkforward#1)
+    needs: [raw-data, build-features, make-matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.make-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U pandas pyarrow
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Download features-base artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: features-base
+          path: _artifacts/features-base
+
+      - name: Unpack features-base into data/ (fast, correct mapping)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/features data/meta data
+
+          if [ -d _artifacts/features-base/features ]; then
+            rsync -a "_artifacts/features-base/features/" "data/features/"
+          elif [ -d _artifacts/features-base/data/features ]; then
+            rsync -a "_artifacts/features-base/data/features/" "data/features/"
+          fi
+
+          if [ -d _artifacts/features-base/meta ]; then
+            rsync -a "_artifacts/features-base/meta/" "data/meta/"
+          elif [ -d _artifacts/features-base/data/meta ]; then
+            rsync -a "_artifacts/features-base/data/meta/" "data/meta/"
+          fi
+
+          if [ -f _artifacts/features-base/universe.csv ]; then
+            cp -v "_artifacts/features-base/universe.csv" "data/universe.csv"
+          elif [ -f _artifacts/features-base/data/universe.csv ]; then
+            cp -v "_artifacts/features-base/data/universe.csv" "data/universe.csv"
+          fi
+
+          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
+            echo "[FALLBACK] features_model missing -> rebuilding features locally"
+            mkdir -p data/features data/meta
+            python scripts/build_features.py
+          fi
+
+          if [ ! -f data/universe.csv ]; then
+            echo "[FALLBACK] universe.csv missing -> generating from raw prices"
+            python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          
+          raw_parq = Path("data/raw/prices.parquet")
+          raw_csv  = Path("data/raw/prices.csv")
+          
+          if raw_parq.exists():
+              df = pd.read_parquet(raw_parq)
+          elif raw_csv.exists():
+              df = pd.read_csv(raw_csv)
+          else:
+              raise SystemExit("[ERROR] raw prices missing")
+          
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
+          
+          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          ticks = sorted(set([t for t in ticks if t]))
+          out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+          Path("data").mkdir(parents=True, exist_ok=True)
+          out.to_csv("data/universe.csv", index=False)
+          print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+          PY
+          fi
+
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+          test -f data/universe.csv
+
+      - name: Verify inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f data/raw/prices.parquet -o -f data/raw/prices.csv
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+          test -f data/universe.csv
+
+      - name: Train Gate/Tail/Tau + Walkforward#1 (this period)
+        env:
+          WF_PERIOD: ${{ matrix.period }}
+          TRAIN_START: ${{ matrix.TRAIN_START }}
+          TRAIN_END: ${{ matrix.TRAIN_END }}
+          VALID_START: ${{ matrix.VALID_START }}
+          VALID_END: ${{ matrix.VALID_END }}
+          TEST_START: ${{ matrix.TEST_START }}
+          TEST_END: ${{ matrix.TEST_END }}
+          CUT_DATE: ${{ matrix.CUT_DATE }}
+
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+          MAX_EXTEND_DAYS: "20"
+
+          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
+          PS_MINS: ${{ inputs.PS_MINS }}
+          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
+          TP1_FRAC: ${{ inputs.TP1_FRAC }}
+          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
+
+          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+          GATE_MODES: ${{ inputs.GATE_MODES }}
+          
+          RANK_METRICS: "p_success"
+          
+          ENABLE_TRAILING: "true"
+          TOPK_CONFIGS: "1|1.0"
+      
+          MAX_LEVERAGE_PCT: "1.0"
+
+          EXCLUDE_TICKERS: ""
+
+          REGIME_MODE: "off"
+          REGIME_DD_MAX: "0.20"
+          REGIME_RET20_MIN: "0.00"
+          REGIME_ATR_MAX: "1.30"
+          REGIME_LEVERAGE_MULT: "3.0"
+
+          TAU_SPLIT: ""
+          USE_TAU_H: "false"
+          ENABLE_DCA: "false"
+
+          WF_TAG_BASE: wf
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/run_walkforward_halfyear.sh
+
+          TAG="wf_${WF_PERIOD}"
+          MODEL_DIR="data/models/${TAG}"
+          mkdir -p "${MODEL_DIR}" data/labels data/meta app data/signals/walkforward
+
+          pick_one () { ls -1 $1 2>/dev/null | head -n 1 || true; }
+
+          python scripts/build_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --start-date "${TRAIN_START}"
+
+          TAG="${TAG}" CUT_DATE="${CUT_DATE}" python - <<'PY'
+          import os
+          from pathlib import Path
+          import pandas as pd
+          
+          TAG=os.environ["TAG"]
+          CUT=pd.to_datetime(os.environ["CUT_DATE"])
+          
+          def read_any(parq, csv):
+              if Path(parq).exists(): return pd.read_parquet(parq)
+              if Path(csv).exists():  return pd.read_csv(csv)
+              raise FileNotFoundError(f"missing {parq} or {csv}")
+          
+          def write_parq(df, p):
+              Path(p).parent.mkdir(parents=True, exist_ok=True)
+              df.to_parquet(p, index=False)
+          
+          f = read_any("data/features/features_model.parquet", "data/features/features_model.csv")
+          f["Date"] = pd.to_datetime(f["Date"], errors="coerce").dt.tz_localize(None)
+          f = f.dropna(subset=["Date"])
+          f_cut = f[f["Date"] <= CUT].copy()
+          write_parq(f_cut, "data/features/features_model.parquet")
+          write_parq(f_cut, f"data/features/features_model_{TAG}.parquet")
+          
+          lm = read_any("data/labels/labels_model.parquet", "data/labels/labels_model.csv")
+          lm["Date"] = pd.to_datetime(lm["Date"], errors="coerce").dt.tz_localize(None)
+          lm = lm.dropna(subset=["Date"])
+          lm_cut = lm[lm["Date"] <= CUT].copy()
+          write_parq(lm_cut, "data/labels/labels_model.parquet")
+          write_parq(lm_cut, f"data/labels/labels_model_{TAG}.parquet")
+          PY
+
+          python scripts/build_tail_labels.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+          TL="$(python - <<'PY'
+          import glob
+          cand=[]
+          cand += glob.glob("data/labels/labels_tail*.parquet")
+          cand += glob.glob("data/labels/labels_tail*.csv")
+          cand += glob.glob("data/labels/*tail*labels*.parquet")
+          cand += glob.glob("data/labels/*tail*labels*.csv")
+          cand=sorted(set(cand))
+          print(cand[0] if cand else "")
+          PY
+          )"
+
+          if [ -n "${TL}" ] && [ -f "${TL}" ]; then
+            if [[ "${TL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
+            OUT_COPY="data/labels/labels_tail_${TAG}${ext}"
+            IN_PATH="${TL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}" python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          
+          p = Path(os.environ["IN_PATH"])
+          cut = pd.to_datetime(os.environ["CUT_DATE"])
+          out_copy = os.environ.get("OUT_COPY","").strip()
+          
+          df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          if "Date" not in df.columns:
+              raise SystemExit(0)
+          
+          dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+          df = df.loc[dt.notna()].copy()
+          df["Date"] = dt.loc[dt.notna()].values
+          df = df[df["Date"] <= cut].copy()
+          
+          if p.suffix==".parquet":
+              df.to_parquet(p, index=False)
+          else:
+              df.to_csv(p, index=False)
+          
+          if out_copy:
+              cp = Path(out_copy); cp.parent.mkdir(parents=True, exist_ok=True)
+              if cp.suffix==".parquet":
+                  df.to_parquet(cp, index=False)
+              else:
+                  df.to_csv(cp, index=False)
+          PY
+          fi
+
+          python scripts/build_tau_labels.py \
+            --tag "${TAG}" \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+          TAUL="$(TAG="${TAG}" python - <<'PY'
+          import os, glob
+          tag=os.environ["TAG"]
+          cand=[]
+          cand += glob.glob(f"data/labels/*tau*{tag}*.parquet")
+          cand += glob.glob(f"data/labels/*tau*{tag}*.csv")
+          cand += glob.glob(f"data/labels/labels_tau_{tag}.parquet")
+          cand += glob.glob(f"data/labels/labels_tau_{tag}.csv")
+          cand=sorted(set(cand))
+          print(cand[0] if cand else "")
+          PY
+          )"
+
+          if [ -n "${TAUL}" ] && [ -f "${TAUL}" ]; then
+            if [[ "${TAUL}" == *.parquet ]]; then ext=".parquet"; else ext=".csv"; fi
+            OUT_COPY="data/labels/labels_tau_${TAG}${ext}"
+            IN_PATH="${TAUL}" CUT_DATE="${CUT_DATE}" OUT_COPY="${OUT_COPY}" python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          
+          p = Path(os.environ["IN_PATH"])
+          cut = pd.to_datetime(os.environ["CUT_DATE"])
+          out_copy = os.environ.get("OUT_COPY","").strip()
+          
+          df = pd.read_parquet(p) if p.suffix==".parquet" else pd.read_csv(p)
+          if "Date" not in df.columns:
+              raise SystemExit(0)
+          
+          dt = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+          df = df.loc[dt.notna()].copy()
+          df["Date"] = dt.loc[dt.notna()].values
+          df = df[df["Date"] <= cut].copy()
+          
+          if p.suffix==".parquet":
+              df.to_parquet(p, index=False)
+          else:
+              df.to_csv(p, index=False)
+          
+          if out_copy:
+              cp = Path(out_copy); cp.parent.mkdir(parents=True, exist_ok=True)
+              if cp.suffix==".parquet":
+                  df.to_parquet(cp, index=False)
+              else:
+                  df.to_csv(cp, index=False)
+          PY
+          fi
+
+          python scripts/train_model.py --tag "${TAG}"
+
+          python scripts/train_tail_model.py \
+            --profit-target "${PROFIT_TARGET}" \
+            --max-days "${MAX_DAYS}" \
+            --stop-level "${STOP_LEVEL}" \
+            --max-extend-days "${MAX_EXTEND_DAYS}"
+
+          python scripts/train_tau_model.py --tag "${TAG}"
+
+          mf="$(pick_one "app/model_*${TAG}*.pkl")"
+          sf="$(pick_one "app/scaler_*${TAG}*.pkl")"
+          test -n "${mf}" && test -n "${sf}"
+          cp -v "${mf}" "${MODEL_DIR}/model.pkl"
+          cp -v "${sf}" "${MODEL_DIR}/scaler.pkl"
+
+          test -f app/tail_model.pkl && test -f app/tail_scaler.pkl
+          cp -v app/tail_model.pkl "${MODEL_DIR}/tail_model.pkl"
+          cp -v app/tail_scaler.pkl "${MODEL_DIR}/tail_scaler.pkl"
+
+          taum="$(pick_one "app/tau_model_*${TAG}*.pkl")"
+          taus="$(pick_one "app/tau_scaler_*${TAG}*.pkl")"
+          test -n "${taum}" && test -n "${taus}"
+          cp -v "${taum}" "${MODEL_DIR}/tau_model.pkl"
+          cp -v "${taus}" "${MODEL_DIR}/tau_scaler.pkl"
+
+          export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
+          export PROFIT_TARGET MAX_DAYS STOP_LEVEL
+          export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
+          export EXCLUDE_TICKERS REGIME_MODE REGIME_DD_MAX REGIME_RET20_MIN REGIME_ATR_MAX REGIME_LEVERAGE_MULT TAU_SPLIT USE_TAU_H ENABLE_DCA
+          export MODEL_DIR
+          export REQUIRE_FILES="${MODEL_DIR}/model.pkl,${MODEL_DIR}/scaler.pkl,${MODEL_DIR}/tail_model.pkl,${MODEL_DIR}/tail_scaler.pkl,${MODEL_DIR}/tau_model.pkl,${MODEL_DIR}/tau_scaler.pkl"
+          export OUT_DIR_BASE="data/signals/walkforward"
+          export WF_TAG_BASE="wf"
+
+          ./scripts/run_walkforward_halfyear.sh
+
+      - name: Upload artifact (models, this period)
+        uses: actions/upload-artifact@v4
+        with:
+          name: models_${{ matrix.period }}
+          path: data/models/wf_${{ matrix.period }}
+          if-no-files-found: error
+
+      - name: Upload artifact (walkforward #1, this period)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward_${{ matrix.period }}
+          path: data/signals/walkforward/${{ matrix.period }}
+          if-no-files-found: warn
+
+  wf2-seq:
+    name: wf2-seq (BadExit + Walkforward#2 sequential)
+    needs: [wf1-parallel, raw-data, build-features, make-matrix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U pandas pyarrow
+
+      - name: Download raw-data artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Download features-base artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: features-base
+          path: _artifacts/features-base
+
+      - name: Unpack features-base into data/ (fast, correct mapping)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/features data/meta data
+
+          if [ -d _artifacts/features-base/features ]; then
+            rsync -a "_artifacts/features-base/features/" "data/features/"
+          elif [ -d _artifacts/features-base/data/features ]; then
+            rsync -a "_artifacts/features-base/data/features/" "data/features/"
+          fi
+
+          if [ -d _artifacts/features-base/meta ]; then
+            rsync -a "_artifacts/features-base/meta/" "data/meta/"
+          elif [ -d _artifacts/features-base/data/meta ]; then
+            rsync -a "_artifacts/features-base/data/meta/" "data/meta/"
+          fi
+
+          if [ -f _artifacts/features-base/universe.csv ]; then
+            cp -v "_artifacts/features-base/universe.csv" "data/universe.csv"
+          elif [ -f _artifacts/features-base/data/universe.csv ]; then
+            cp -v "_artifacts/features-base/data/universe.csv" "data/universe.csv"
+          fi
+
+          if [ ! -f data/features/features_model.parquet ] && [ ! -f data/features/features_model.csv ]; then
+            echo "[FALLBACK] features_model missing -> rebuilding features locally"
+            python scripts/build_features.py
+          fi
+
+          if [ ! -f data/universe.csv ]; then
+            echo "[FALLBACK] universe.csv missing -> generating from raw prices"
+            python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          raw_parq = Path("data/raw/prices.parquet")
+          raw_csv  = Path("data/raw/prices.csv")
+          if raw_parq.exists():
+              df = pd.read_parquet(raw_parq)
+          elif raw_csv.exists():
+              df = pd.read_csv(raw_csv)
+          else:
+              raise SystemExit("[ERROR] raw prices missing")
+          if "Ticker" not in df.columns:
+              raise SystemExit("[ERROR] raw prices missing Ticker column")
+          ticks = df["Ticker"].astype(str).str.upper().str.strip().dropna().unique().tolist()
+          ticks = sorted(set([t for t in ticks if t]))
+          out = pd.DataFrame({"Ticker": ticks, "Enabled": True})
+          Path("data").mkdir(parents=True, exist_ok=True)
+          out.to_csv("data/universe.csv", index=False)
+          print(f"[DONE] wrote data/universe.csv tickers={len(out)}")
+          PY
+          fi
+
+          test -f data/features/features_model.parquet -o -f data/features/features_model.csv
+          test -f data/universe.csv
+
+      - name: Download models_* artifacts (keep per-artifact dirs)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: models_*
+          path: _wf1_artifacts/models
+
+      - name: Download walkforward_* artifacts (keep per-artifact dirs)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: walkforward_*
+          path: _wf1_artifacts/walkforward
+
+      - name: Rebuild wf1 structure from per-artifact dirs (robust, minimal output)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/badexit_state data/labels data/meta app
+          shopt -s nullglob
+
+          for d in _wf1_artifacts/models/models_*; do
+            base="$(basename "$d")"
+            period="${base#models_}"
+            out="data/models/wf_${period}"
+            mkdir -p "$out"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          for d in _wf1_artifacts/walkforward/walkforward_*; do
+            base="$(basename "$d")"
+            period="${base#walkforward_}"
+            out="data/signals/walkforward/${period}"
+            mkdir -p "$out"
+            rsync -a "${d}/" "${out}/"
+          done
+
+          test "$(find data/models -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
+          test "$(find data/signals/walkforward -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
+
+      - name: Sequential BadExit(expanding past-only) + WF#2 (incremental labels + skip-train)
+        env:
+          MATRIX_JSON: ${{ needs.make-matrix.outputs.matrix }}
+
+          PROFIT_TARGET: ${{ inputs.PROFIT_TARGET }}
+          MAX_DAYS: ${{ inputs.MAX_DAYS }}
+          STOP_LEVEL: ${{ inputs.STOP_LEVEL }}
+          MAX_EXTEND_DAYS: "20"
+
+          P_TAIL_THRESHOLDS: ${{ inputs.P_TAIL_THRESHOLDS }}
+          UTILITY_QUANTILES: ${{ inputs.UTILITY_QUANTILES }}
+          PS_MINS: ${{ inputs.PS_MINS }}
+          TRAIL_STOPS: ${{ inputs.TRAIL_STOPS }}
+          TP1_FRAC: ${{ inputs.TP1_FRAC }}
+          BADEXIT_MAXES: ${{ inputs.BADEXIT_MAXES }}
+
+          LAMBDA_TAIL: ${{ inputs.LAMBDA_TAIL }}
+          GATE_MODES: ${{ inputs.GATE_MODES }}
+          
+          RANK_METRICS: "p_success"
+          
+          ENABLE_TRAILING: "true"
+          TOPK_CONFIGS: "1|1.0"
+      
+          MAX_LEVERAGE_PCT: "1.0"
+
+          EXCLUDE_TICKERS: ""
+
+          REGIME_MODE: "off"
+          REGIME_DD_MAX: "0.20"
+          REGIME_RET20_MIN: "0.00"
+          REGIME_ATR_MAX: "1.30"
+          REGIME_LEVERAGE_MULT: "3.0"
+
+          TAU_SPLIT: ""
+          USE_TAU_H: "false"
+          ENABLE_DCA: "false"
+
+          WF_TAG_BASE: wf
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/run_walkforward_halfyear.sh
+          echo "$MATRIX_JSON" > /tmp/matrix.json
+
+          mkdir -p data/models data/signals/walkforward data/signals/walkforward2 data/badexit_pool data/badexit_state data/labels data/meta app
+
+          python - <<'PY' > /tmp/periods.tsv
+          import json
+          m=json.load(open("/tmp/matrix.json","r"))["include"]
+          for it in m:
+              print("\t".join([
+                  it["period"],
+                  it["TRAIN_START"], it["TRAIN_END"],
+                  it["VALID_START"], it["VALID_END"],
+                  it["TEST_START"], it["TEST_END"],
+                  it["CUT_DATE"],
+              ]))
+          PY
+
+          ex_tag () {
+            python - <<'PY'
+          import os
+          pt=float(os.environ["PROFIT_TARGET"])
+          h=int(os.environ["MAX_DAYS"])
+          sl=float(os.environ["STOP_LEVEL"])
+          ex=int(os.environ["MAX_EXTEND_DAYS"])
+          pt_i=int(round(pt*100))
+          sl_i=int(round(abs(sl)*100))
+          print(f"pt{pt_i}_h{h}_sl{sl_i}_ex{ex}")
+          PY
+          }
+
+          POOL="data/badexit_pool"
+          STATE="data/badexit_state"
+          PROC_LIST="${STATE}/processed_trades.txt"
+          LAST_LABEL_SHA="${STATE}/labels_master.sha256"
+          LAST_TRAIN_SHA="${STATE}/train.sha256"
+
+          touch "${PROC_LIST}"
+
+          EX_TAG="$(ex_tag)"
+          export EX_TAG
+
+          MASTER_LABEL="data/labels/labels_badexit_master_${EX_TAG}.parquet"
+          DELTA_DIR="${STATE}/delta_trades"
+          mkdir -p "${DELTA_DIR}"
+
+          normalize_pool_to_parquet () {
+            shopt -s nullglob
+            for f in "${POOL}"/sim_engine_trades_*.csv; do
+              out="${f%.csv}.parquet"
+              INP="$f" OUT="$out" python - <<'PY'
+          import os
+          import pandas as pd
+          inp=os.environ["INP"]
+          out=os.environ["OUT"]
+          df=pd.read_csv(inp)
+          df.to_parquet(out, index=False)
+          PY
+              rm -f "$f"
+            done
+          }
+
+          compute_delta_list () {
+            find "${POOL}" -maxdepth 1 -type f -name "sim_engine_trades_*.parquet" -printf "%f\n" | sort > "${STATE}/pool_list_now.txt"
+            comm -23 "${STATE}/pool_list_now.txt" <(sort -u "${PROC_LIST}") > "${STATE}/delta_list.txt" || true
+            wc -l < "${STATE}/delta_list.txt" | tr -d ' '
+          }
+
+          build_badexit_labels_delta () {
+            local n_delta="$1"
+            if [ "${n_delta}" = "0" ]; then
+              echo "[BADEXIT] delta=0 -> label update skip"
+              return 0
+            fi
+
+            rm -rf "${DELTA_DIR}"
+            mkdir -p "${DELTA_DIR}"
+
+            while IFS= read -r rel; do
+              [ -z "$rel" ] && continue
+              cp -v "${POOL}/${rel}" "${DELTA_DIR}/${rel}" >/dev/null
+            done < "${STATE}/delta_list.txt"
+
+            python scripts/build_badexit_labels.py \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${MAX_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}" \
+              --signals-dir "${DELTA_DIR}"
+
+            badlbl="data/labels/labels_badexit_${EX_TAG}.parquet"
+            if [ ! -f "${badlbl}" ]; then
+              badcsv="data/labels/labels_badexit_${EX_TAG}.csv"
+              if [ -f "${badcsv}" ]; then
+                INP="${badcsv}" OUT="${badlbl}" python - <<'PY'
+          import os
+          import pandas as pd
+          inp=os.environ["INP"]
+          out=os.environ["OUT"]
+          df=pd.read_csv(inp)
+          df.to_parquet(out, index=False)
+          PY
+              fi
+            fi
+            test -f "${badlbl}"
+
+            DELTA_LBL="${badlbl}" MASTER_LBL="${MASTER_LABEL}" python - <<'PY'
+          import os
+          import pandas as pd
+          from pathlib import Path
+          
+          delta_path = Path(os.environ["DELTA_LBL"])
+          master_path = Path(os.environ["MASTER_LBL"])
+          
+          d = pd.read_parquet(delta_path)
+          
+          if master_path.exists():
+              m = pd.read_parquet(master_path)
+              out = pd.concat([m, d], ignore_index=True)
+          else:
+              out = d
+          
+          cols = list(out.columns)
+          subset = None
+          if "Date" in cols and "Ticker" in cols:
+              subset = ["Date", "Ticker"] + [c for c in cols if c.startswith("y_") or "badexit" in c.lower()]
+              subset = [c for c in subset if c in cols]
+          out = out.drop_duplicates(subset=subset) if subset else out.drop_duplicates()
+          
+          master_path.parent.mkdir(parents=True, exist_ok=True)
+          out.to_parquet(master_path, index=False)
+          print("[BADEXIT] master rows=", len(out))
+          PY
+
+            sha256sum "${MASTER_LABEL}" | cut -d ' ' -f1 > "${LAST_LABEL_SHA}"
+
+            cat "${STATE}/delta_list.txt" >> "${PROC_LIST}"
+            sort -u "${PROC_LIST}" -o "${PROC_LIST}"
+          }
+
+          maybe_train_badexit () {
+            if [ ! -f "${MASTER_LABEL}" ]; then
+              echo "[BADEXIT] master label missing -> train skip"
+              return 1
+            fi
+            cur_sha="$(sha256sum "${MASTER_LABEL}" | cut -d ' ' -f1)"
+            prev_sha="$(cat "${LAST_TRAIN_SHA}" 2>/dev/null || true)"
+            if [ -n "${prev_sha}" ] && [ "${cur_sha}" = "${prev_sha}" ] && [ -f app/badexit_model_latest.pkl ] && [ -f app/badexit_scaler_latest.pkl ]; then
+              echo "[BADEXIT] train skip (labels unchanged)"
+              return 0
+            fi
+
+            LABEL_COL="$(MASTER="${MASTER_LABEL}" python - <<'PY'
+          import os
+          import pandas as pd
+          p=os.environ["MASTER"]
+          df=pd.read_parquet(p)
+          cols=list(df.columns)
+          for c in ["y_badexit","BadExit","badexit","is_badexit","label","target"]:
+              if c in cols:
+                  print(c)
+                  raise SystemExit(0)
+          print("__MISSING__")
+          PY
+            )"
+            if [ "${LABEL_COL}" = "__MISSING__" ]; then
+              echo "[ERROR] badexit label col missing in master"
+              exit 1
+            fi
+
+            python scripts/train_badexit_model_wf_lite.py \
+              --data-path "${MASTER_LABEL}" \
+              --label-col "${LABEL_COL}" \
+              --out-model "app/badexit_model_latest.pkl" \
+              --out-scaler "app/badexit_scaler_latest.pkl" \
+              --out-report "data/meta/train_badexit_report_latest.json"
+
+            test -f app/badexit_model_latest.pkl
+            test -f app/badexit_scaler_latest.pkl
+
+            echo "${cur_sha}" > "${LAST_TRAIN_SHA}"
+            return 0
+          }
+
+          normalize_pool_to_parquet
+
+          total="$(wc -l < /tmp/periods.tsv | tr -d ' ')"
+          idx=0
+
+          while IFS=$'\t' read -r WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE; do
+            idx=$((idx+1))
+            TAG="wf_${WF_PERIOD}"
+            MODEL_DIR="data/models/${TAG}"
+            WF1_DIR="data/signals/walkforward/${WF_PERIOD}"
+            WF2_DIR="data/signals/walkforward2/${WF_PERIOD}"
+
+            echo "[WF2] ${WF_PERIOD} (#${idx}/${total})"
+            test -d "${MODEL_DIR}"
+            test -d "${WF1_DIR}"
+
+            n_delta="$(compute_delta_list)"
+            if [ "${n_delta}" != "0" ]; then
+              echo "[BADEXIT] delta files=${n_delta} -> update master labels"
+              build_badexit_labels_delta "${n_delta}"
+            fi
+
+            BADEXIT_AVAILABLE="false"
+            if [ -f "${MASTER_LABEL}" ]; then
+              BADEXIT_AVAILABLE="true"
+              maybe_train_badexit || true
+              if [ -f app/badexit_model_latest.pkl ] && [ -f app/badexit_scaler_latest.pkl ]; then
+                cp -v app/badexit_model_latest.pkl "${MODEL_DIR}/badexit_model.pkl" >/dev/null
+                cp -v app/badexit_scaler_latest.pkl "${MODEL_DIR}/badexit_scaler.pkl" >/dev/null
+              else
+                BADEXIT_AVAILABLE="false"
+              fi
+            fi
+
+            export WF_PERIOD TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END CUT_DATE
+            export PROFIT_TARGET MAX_DAYS STOP_LEVEL
+            export P_TAIL_THRESHOLDS UTILITY_QUANTILES RANK_METRICS LAMBDA_TAIL GATE_MODES TRAIL_STOPS TP1_FRAC ENABLE_TRAILING TOPK_CONFIGS PS_MINS BADEXIT_MAXES MAX_LEVERAGE_PCT
+            export EXCLUDE_TICKERS REGIME_MODE REGIME_DD_MAX REGIME_RET20_MIN REGIME_ATR_MAX REGIME_LEVERAGE_MULT TAU_SPLIT USE_TAU_H ENABLE_DCA
+            export MODEL_DIR
+
+            if [ "${BADEXIT_AVAILABLE}" != "true" ]; then
+              mkdir -p "${WF2_DIR}"
+              rsync -a "${WF1_DIR}/" "${WF2_DIR}/" >/dev/null || true
+            else
+              export REQUIRE_FILES="${MODEL_DIR}/model.pkl,${MODEL_DIR}/scaler.pkl,${MODEL_DIR}/tail_model.pkl,${MODEL_DIR}/tail_scaler.pkl,${MODEL_DIR}/tau_model.pkl,${MODEL_DIR}/tau_scaler.pkl,${MODEL_DIR}/badexit_model.pkl,${MODEL_DIR}/badexit_scaler.pkl"
+              export OUT_DIR_BASE="data/signals/walkforward2"
+              export WF_TAG_BASE="wf"
+              ./scripts/run_walkforward_halfyear.sh
+            fi
+
+            # pool append: parquet only
+            shopt -s nullglob
+            added=0
+
+            for f in "${WF1_DIR}"/sim_engine_trades_*.parquet; do
+              base="$(basename "$f")"
+              out="${POOL}/sim_engine_trades_${EX_TAG}__${WF_PERIOD}__${base}"
+              if [ ! -f "${out}" ]; then
+                cp -v "$f" "${out}" >/dev/null
+                added=$((added+1))
+              fi
+            done
+
+            for f in "${WF1_DIR}"/sim_engine_trades_*.csv; do
+              base="$(basename "$f")"
+              tmp="${STATE}/_tmp_${WF_PERIOD}_${base%.csv}.parquet"
+              INP="$f" OUT="$tmp" python - <<'PY'
+          import os
+          import pandas as pd
+          inp=os.environ["INP"]
+          out=os.environ["OUT"]
+          df=pd.read_csv(inp)
+          df.to_parquet(out, index=False)
+          PY
+              out="${POOL}/sim_engine_trades_${EX_TAG}__${WF_PERIOD}__${base%.csv}.parquet"
+              if [ ! -f "${out}" ]; then
+                mv -v "$tmp" "${out}" >/dev/null
+                added=$((added+1))
+              else
+                rm -f "$tmp"
+              fi
+            done
+
+            if [ "${added}" != "0" ]; then
+              echo "[POOL] added=${added}"
+            fi
+          done < /tmp/periods.tsv
+
+      - name: Upload artifact (walkforward2 all)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward2_all
+          path: data/signals/walkforward2
+          if-no-files-found: error
+
+  aggregate:
+    name: aggregate-walkforward2
+    needs: [wf2-seq]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install deps (aggregate)
+        run: |
+          python -m pip install -U pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -U pandas pyarrow
+
+      - name: Download raw-data artifact (for QQQ benchmark)
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-data
+          path: data/raw
+
+      - name: Download walkforward2_all artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: walkforward2_all
+          path: _wf2_all
+
+      - name: Rebuild expected folder structure (walkforward2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/signals/walkforward2
+          rsync -a "_wf2_all/" "data/signals/walkforward2/"
+          test "$(find data/signals/walkforward2 -mindepth 1 -maxdepth 1 -type d | wc -l)" -ge 1
+
+      - name: Aggregate metrics across periods (walkforward2)
+        run: |
+          set -euo pipefail
+          python scripts/aggregate_walkforward_halfyear.py \
+            --root data/signals/walkforward2 \
+            --out data/signals/walkforward2/_summary_walkforward2.csv
+          test -f data/signals/walkforward2/_summary_walkforward2.csv
+
+      - name: Analyze summary (rank configs, walkforward2)
+        run: |
+          set -euo pipefail
+          python scripts/analyze_walkforward_summary.py \
+            --summary data/signals/walkforward2/_summary_walkforward2.csv \
+            --out data/signals/walkforward2/_analysis_walkforward2.csv
+          test -f data/signals/walkforward2/_analysis_walkforward2.csv
+
+      - name: Upload artifact (walkforward2 summary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward2_summary
+          path: |
+            data/signals/walkforward2/_summary_walkforward2.csv
+            data/signals/walkforward2/_analysis_walkforward2.csv
+          if-no-files-found: error

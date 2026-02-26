@@ -37,11 +37,16 @@ on:
         description: "tp1_frac quantiles"
         required: true
         default: "0.50,1.00"
-        
+
       lambda_tail:
         description: "utility tail penalty lambda (single float, e.g. 0.05)"
         required: true
         default: "0.20"
+
+      badexit_maxes:
+        description: "comma-separated p_badexit max cutoffs (e.g. 1.00,0.50,0.30)"
+        required: true
+        default: "1.00,0.50,0.30"
 
       rebuild_all:
         description: "true to rebuild prices/features/labels/models from scratch"
@@ -68,21 +73,19 @@ jobs:
       STOP_LEVEL: ${{ github.event.inputs.stop_level || '-0.10' }}
 
       P_TAIL_THRESHOLDS: ${{ github.event.inputs.p_tail_thresholds || '0.10,0.20,0.30' }}
-      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.60,0.75,0.90' }}
-      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.60,0.70' }}
-      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score' }}
-      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.05' }}
-      
-      REVAL_PS_STRONG: ${{ github.event.inputs.reval_ps_strong || '0.70' }}
-      REVAL_PT_STRONG: ${{ github.event.inputs.reval_pt_strong || '0.15' }}
-      REVAL_PS_PASS: ${{ github.event.inputs.reval_ps_pass || '0.50' }}
-      REVAL_PT_PASS: ${{ github.event.inputs.reval_pt_pass || '0.20' }}
-      
+      UTILITY_QUANTILES: ${{ github.event.inputs.utility_quantiles || '0.01,0.20,0.50' }}
+      PS_MINS: ${{ github.event.inputs.ps_mins || '0.00,0.50,0.70' }}
+      RANK_METRICS: ${{ github.event.inputs.rank_metrics || 'utility,ret_score,p_success' }}
+      LAMBDA_TAIL: ${{ github.event.inputs.lambda_tail || '0.20' }}
+
+      BADEXIT_MAXES: ${{ github.event.inputs.badexit_maxes || '1.00,0.50,0.30' }}
+
       REBUILD_ALL: ${{ github.event.inputs.rebuild_all || 'true' }}
+      DEDUP_PICKS: ${{ github.event.inputs.dedup_picks || 'false' }}
 
       PRICE_START: "2008-01-01"
       PRICE_END: "2026-01-01"
-      MAX_YEARS: "21"   # 예: 15년 + 1년 워밍업 느낌 (원하는 값으로)
+      MAX_YEARS: "21"
 
       GATE_MODES: "none,tail,utility,tail_utility"
 
@@ -90,17 +93,20 @@ jobs:
       TP1_FRAC: ${{ github.event.inputs.tp1_frac || '1.00' }}
       TRAIL_STOPS: "0.10"
 
-      # ✅ TopK2 제거
       TOPK_CONFIGS: "1|1.0"
       MAX_LEVERAGE_PCT: "1.00"
       CAP_COMPARE: "false"
       TP1_HOLD_CAP_SINGLE: "none"
-
+      # ---- regime filter (gate)
+      REGIME_MODE: "combo"          # off|basic|trend|dd|combo
+      REGIME_DD_MAX: "0.20"         # e.g. 0.20 => -20%
+      REGIME_RET20_MIN: "0.00"      # e.g. 0.00
+      REGIME_ATR_MAX: "1.30"        # e.g. 1.30
+      REGIME_LEVERAGE_MULT: "3.0"   # 3x universe
+      # base folder (run_grid_workflow.sh 내부에서 TAU_SPLIT로 split 폴더 자동 분리)
       OUT_DIR: "data/signals"
       EXCLUDE_TICKERS: "SPY,^VIX"
       REQUIRE_FILES: "data/features/features_scored.parquet,app/model.pkl,app/scaler.pkl"
-
-      DEDUP_PICKS: ${{ github.event.inputs.dedup_picks || 'true' }}
 
     steps:
       - name: Checkout
@@ -128,7 +134,7 @@ jobs:
           set -euo pipefail
           mkdir -p data/raw data/features data/labels data/signals data/meta app scripts data/_backup
 
-      - name: Set env keys (LABEL_KEY + MAX_EXTEND_DAYS auto)
+      - name: Set env keys (LABEL_KEY + MAX_EXTEND_DAYS auto + EX_TAG)
         shell: bash
         run: |
           set -euo pipefail
@@ -155,6 +161,9 @@ jobs:
           )"
           echo "MAX_EXTEND_DAYS=${MAX_EX}" >> "$GITHUB_ENV"
 
+          EX_TAG="pt${PT100}_h${MAX_DAYS}_sl${SL100}_ex${MAX_EX}"
+          echo "EX_TAG=${EX_TAG}" >> "$GITHUB_ENV"
+
       - name: Restore cache (PRICES)
         uses: actions/cache@v4
         with:
@@ -163,7 +172,6 @@ jobs:
             data/raw/prices.csv
             data/raw/prices_meta.json
           key: mumumeme-prices-v3-${{ runner.os }}-ys${{ env.MAX_YEARS }}-ps${{ env.PRICE_START }}-${{ hashFiles('data/universe.csv','scripts/universe.py','scripts/fetch_prices.py') }}
-          
           restore-keys: |
             mumumeme-prices-v3-${{ runner.os }}-ys${{ env.MAX_YEARS }}-ps${{ env.PRICE_START }}-
             mumumeme-prices-v3-${{ runner.os }}-
@@ -209,7 +217,6 @@ jobs:
             mumumeme-tail-v3-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tail-v3-${{ runner.os }}-
 
-      # ✅ TAU: 두 분포 모두 캐시
       - name: Restore cache (TAU)
         uses: actions/cache@v4
         with:
@@ -224,13 +231,14 @@ jobs:
             mumumeme-tau-v4-${{ runner.os }}-${{ env.LABEL_KEY }}-
             mumumeme-tau-v4-${{ runner.os }}-
 
-      - name: Prepare required files (10y only + build both tau splits + make 2 features_scored)
+      - name: Prepare required files (prices/features/labels/models + make 2 features_scored)
         shell: bash
         run: |
           set -euo pipefail
           echo "[INFO] PROFIT_TARGET=$PROFIT_TARGET MAX_DAYS=$MAX_DAYS STOP_LEVEL=$STOP_LEVEL MAX_EXTEND_DAYS=$MAX_EXTEND_DAYS"
-          echo "[INFO] LABEL_KEY=$LABEL_KEY"
+          echo "[INFO] LABEL_KEY=$LABEL_KEY EX_TAG=$EX_TAG"
           echo "[INFO] DEDUP_PICKS=$DEDUP_PICKS"
+          echo "[INFO] BADEXIT_MAXES=$BADEXIT_MAXES"
 
           if [ "${REBUILD_ALL}" = "true" ]; then
             rm -rf data/raw/* data/features/* data/labels/* app/* data/signals/* data/meta/* || true
@@ -264,16 +272,6 @@ jobs:
             echo "[INFO] p_success model exists -> reuse"
           fi
 
-          EX_TAG="pt$(python - "$PROFIT_TARGET" <<'PY'
-          import sys
-          pt=float(sys.argv[1]); print(int(round(pt*100)))
-          PY
-          )_h${MAX_DAYS}_sl$(python - "$STOP_LEVEL" <<'PY'
-          import sys
-          sl=float(sys.argv[1]); print(int(round(abs(sl)*100)))
-          PY
-          )_ex${MAX_EXTEND_DAYS}"
-
           if [ ! -f "data/labels/labels_tail_${EX_TAG}.parquet" ] && [ ! -f "data/labels/labels_tail_${EX_TAG}.csv" ]; then
             python scripts/build_tail_labels.py \
               --profit-target "${PROFIT_TARGET}" \
@@ -294,11 +292,11 @@ jobs:
             echo "[INFO] tail model exists -> reuse"
           fi
 
-          # ✅ Tau split tags
+          # Tau split tags
           TAU_TAG_CUR="${LABEL_KEY}_tau_cur"
           TAU_TAG_Q="${LABEL_KEY}_tau_q255025"
 
-          # ✅ (A) labels_tau: current
+          # labels_tau: current
           if [ ! -f "data/labels/labels_tau_${TAU_TAG_CUR}.parquet" ] && [ ! -f "data/labels/labels_tau_${TAU_TAG_CUR}.csv" ]; then
             python scripts/build_tau_labels.py \
               --tag "${TAU_TAG_CUR}" \
@@ -312,7 +310,7 @@ jobs:
             echo "[INFO] labels_tau(current) exists -> reuse"
           fi
 
-          # ✅ (B) labels_tau: 25/50/25
+          # labels_tau: 25/50/25
           if [ ! -f "data/labels/labels_tau_${TAU_TAG_Q}.parquet" ] && [ ! -f "data/labels/labels_tau_${TAU_TAG_Q}.csv" ]; then
             python scripts/build_tau_labels.py \
               --tag "${TAU_TAG_Q}" \
@@ -326,7 +324,7 @@ jobs:
             echo "[INFO] labels_tau(q255025) exists -> reuse"
           fi
 
-          # ✅ train_tau_model: 두 분포 각각 별도 파일로 저장
+          # train_tau_model: 두 분포 각각 별도 파일로 저장
           if [ ! -f "app/tau_model_${TAU_TAG_CUR}.pkl" ] || [ ! -f "app/tau_scaler_${TAU_TAG_CUR}.pkl" ]; then
             python scripts/train_tau_model.py \
               --tag "${TAU_TAG_CUR}" \
@@ -345,7 +343,7 @@ jobs:
             echo "[INFO] tau model(q255025) exists -> reuse"
           fi
 
-          # ✅ score_features를 "tau 모델 파일을 명시"해서 2종 생성
+          # score_features: tau_cur
           python scripts/score_features.py \
             --tag "${LABEL_KEY}" \
             --tau-model "app/tau_model_${TAU_TAG_CUR}.pkl" \
@@ -364,6 +362,7 @@ jobs:
               raise SystemExit("missing features_scored_tau_cur.parquet")
           PY
 
+          # score_features: tau_q255025
           python scripts/score_features.py \
             --tag "${LABEL_KEY}" \
             --tau-model "app/tau_model_${TAU_TAG_Q}.pkl" \
@@ -382,53 +381,162 @@ jobs:
               raise SystemExit("missing features_scored_tau_q255025.parquet")
           PY
 
-      - name: Run gate grid twice (cur + q255025) and keep outputs separated
+      - name: Run gate grid twice (split folders) + build split badexit labels + optional train badexit
         shell: bash
         run: |
           set -euo pipefail
           chmod +x scripts/run_grid_workflow.sh
 
-          # ---------- RUN #1: current ----------
+          # ---------- RUN #1: taucur ----------
           cp -f data/features/features_scored_tau_cur.parquet data/features/features_scored.parquet
           cp -f data/features/features_scored_tau_cur.csv data/features/features_scored.csv
 
-          echo "[INFO] RUN#1 tau_split=cur"
-          ( export TAU_SPLIT="cur"; export LABEL_KEY="${LABEL_KEY}_taucur"; bash scripts/run_grid_workflow.sh )
+          echo "[INFO] RUN#1 tau_split=taucur"
+          (
+            export TAU_SPLIT="taucur"
+            export OUT_DIR="data/signals"              # ✅ base only (중요!)
+            export LABEL_KEY="${LABEL_KEY}_taucur"
+            bash scripts/run_grid_workflow.sh
+          )
 
-          # ---------- RUN #2: q255025 ----------
+          # build badexit labels for taucur (if script exists)
+          if [ -f scripts/build_badexit_labels.py ]; then
+            python scripts/build_badexit_labels.py \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${MAX_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}" \
+              --signals-dir "data/signals/taucur" \
+              --pattern "sim_engine_trades_*.parquet" || true
+
+            if [ -f "data/labels/labels_badexit_${EX_TAG}.parquet" ]; then
+              mv -f "data/labels/labels_badexit_${EX_TAG}.parquet" "data/labels/labels_badexit_${EX_TAG}_taucur.parquet"
+            fi
+            if [ -f "data/labels/labels_badexit_${EX_TAG}.csv" ]; then
+              mv -f "data/labels/labels_badexit_${EX_TAG}.csv" "data/labels/labels_badexit_${EX_TAG}_taucur.csv"
+            fi
+          else
+            echo "[INFO] scripts/build_badexit_labels.py missing -> skip badexit labels"
+          fi
+
+          # ---------- RUN #2: tauq255025 ----------
           cp -f data/features/features_scored_tau_q255025.parquet data/features/features_scored.parquet
           cp -f data/features/features_scored_tau_q255025.csv data/features/features_scored.csv
 
-          echo "[INFO] RUN#2 tau_split=q255025"
-          ( export TAU_SPLIT="q255025"; export LABEL_KEY="${LABEL_KEY}_tauq255025"; bash scripts/run_grid_workflow.sh )
+          echo "[INFO] RUN#2 tau_split=tauq255025"
+          (
+            export TAU_SPLIT="tauq255025"
+            export OUT_DIR="data/signals"              # ✅ base only (중요!)
+            export LABEL_KEY="${LABEL_KEY}_tauq255025"
+            bash scripts/run_grid_workflow.sh
+          )
 
-      - name: Aggregate summaries (single file containing BOTH splits)
+          # build badexit labels for tauq255025
+          if [ -f scripts/build_badexit_labels.py ]; then
+            python scripts/build_badexit_labels.py \
+              --profit-target "${PROFIT_TARGET}" \
+              --max-days "${MAX_DAYS}" \
+              --stop-level "${STOP_LEVEL}" \
+              --max-extend-days "${MAX_EXTEND_DAYS}" \
+              --signals-dir "data/signals/tauq255025" \
+              --pattern "sim_engine_trades_*.parquet" || true
+
+            if [ -f "data/labels/labels_badexit_${EX_TAG}.parquet" ]; then
+              mv -f "data/labels/labels_badexit_${EX_TAG}.parquet" "data/labels/labels_badexit_${EX_TAG}_tauq255025.parquet"
+            fi
+            if [ -f "data/labels/labels_badexit_${EX_TAG}.csv" ]; then
+              mv -f "data/labels/labels_badexit_${EX_TAG}.csv" "data/labels/labels_badexit_${EX_TAG}_tauq255025.csv"
+            fi
+          fi
+
+          # combined labels_badexit (training convenience)
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          ex_tag = (Path(".") / "data" / "labels").resolve()
+          files = sorted(ex_tag.glob("labels_badexit_*_tau*.parquet"))
+          if len(files) >= 2:
+              df = pd.concat([pd.read_parquet(files[-2]), pd.read_parquet(files[-1])], ignore_index=True)
+              if "BadExit" in df.columns:
+                  df = df.groupby(["Date","Ticker"], as_index=False)["BadExit"].max()
+              outp = Path("data/labels/labels_badexit.parquet")
+              outc = Path("data/labels/labels_badexit.csv")
+              outp.parent.mkdir(parents=True, exist_ok=True)
+              df.to_parquet(outp, index=False)
+              df.to_csv(outc, index=False)
+              print("[DONE] wrote combined:", outp, "rows=", len(df))
+          else:
+              print("[INFO] split badexit labels not found -> skip combined")
+          PY
+
+          # optional: train badexit model if script exists
+          if [ -f scripts/train_badexit_model.py ]; then
+            python scripts/train_badexit_model.py || true
+          else
+            echo "[INFO] scripts/train_badexit_model.py missing -> skip badexit model"
+          fi
+
+      - name: Aggregate summaries (per split + combined)
         shell: bash
         run: |
           set -euo pipefail
+
           python scripts/aggregate_gate_grid.py \
-            --signals-dir "data/signals" \
-            --out-aggregate "data/signals/gate_grid_aggregate.csv" \
-            --out-top "data/signals/gate_grid_top_by_recent10y.csv" \
+            --signals-dir "data/signals/taucur" \
+            --out-aggregate "data/signals/taucur/gate_grid_aggregate.csv" \
+            --out-top "data/signals/taucur/gate_grid_top_by_recent10y.csv" \
             --pattern "gate_summary_*.csv" \
             --topn 50
+
+          python scripts/aggregate_gate_grid.py \
+            --signals-dir "data/signals/tauq255025" \
+            --out-aggregate "data/signals/tauq255025/gate_grid_aggregate.csv" \
+            --out-top "data/signals/tauq255025/gate_grid_top_by_recent10y.csv" \
+            --pattern "gate_summary_*.csv" \
+            --topn 50
+
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+
+          outs = []
+          for split in ["taucur","tauq255025"]:
+              p = Path(f"data/signals/{split}/gate_grid_aggregate.csv")
+              if p.exists():
+                  df = pd.read_csv(p)
+                  df["tau_split"] = split
+                  outs.append(df)
+          if outs:
+              all_df = pd.concat(outs, ignore_index=True)
+              out = Path("data/signals/gate_grid_aggregate.csv")
+              all_df.to_csv(out, index=False)
+              print("[DONE] wrote", out, "rows=", len(all_df))
+
+          outs = []
+          for split in ["taucur","tauq255025"]:
+              p = Path(f"data/signals/{split}/gate_grid_top_by_recent10y.csv")
+              if p.exists():
+                  df = pd.read_csv(p)
+                  df["tau_split"] = split
+                  outs.append(df)
+          if outs:
+              all_df = pd.concat(outs, ignore_index=True)
+              out = Path("data/signals/gate_grid_top_by_recent10y.csv")
+              all_df.to_csv(out, index=False)
+              print("[DONE] wrote", out, "rows=", len(all_df))
+          PY
 
       - name: Upload artifacts (signals)
         uses: actions/upload-artifact@v4
         with:
           name: gate-grid-results
           path: |
-            data/signals/gate_summary_*.csv
-            data/signals/gate_grid_aggregate.csv
-            data/signals/gate_grid_top_by_recent10y.csv
-            data/signals/picks_*.csv
-            data/signals/picks_meta_*.json
-            data/signals/sim_engine_trades_*.parquet
-            data/signals/sim_engine_curve_*.parquet
-            data/features/features_scored.csv
-            data/features/features_scored.parquet
+            data/signals/**
             data/features/features_scored_tau_cur.csv
             data/features/features_scored_tau_cur.parquet
             data/features/features_scored_tau_q255025.csv
             data/features/features_scored_tau_q255025.parquet
+            data/labels/labels_badexit*.parquet
+            data/labels/labels_badexit*.csv
           if-no-files-found: error
